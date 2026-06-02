@@ -42,10 +42,10 @@
             </div>
             <p class="calc-total">总计: <span>¥{{ currentDetected.totalPrice.toFixed(2) }}</span></p>
           </div>
-          <button class="btn btn-primary add-btn" @click="addToCart" :disabled="currentDetected.weight <= 0">确认添加</button>
+          <button class="btn btn-primary add-btn" @click="addToCart" :disabled="!weightStable || currentDetected.weight <= 0">确认添加</button>
         </div>
         <div class="current-item-panel empty" v-else-if="isRecognizing && !currentDetected">
-          <p>请将果蔬放置在摄像头下与秤台上...</p>
+          <p>{{ recognitionHint }}</p>
         </div>
 
         <div class="controls">
@@ -243,6 +243,9 @@ const showTerminalCheatAlert = ref(false);
 const terminalCheatAlert = ref({});
 const hasMultiItemError = ref(false);
 const multiItemMessage = ref('');
+const recognitionStatus = ref('waiting');
+const recognitionHint = ref('请将果蔬放置在摄像头下与秤台上...');
+const weightStable = ref(false);
 
 const roiBoxStyle = computed(() => {
   videoGeometryVersion.value;
@@ -306,14 +309,23 @@ const toggleRecognition = async () => {
       handOverlayEnabled.value = Boolean(data.hand_overlay_enabled);
 
       let realWeight = Math.max(0, data.weight || 0);
-      if (data.status === 'multi_item_error' || data.item_status === 'multi_item_error') {
+      recognitionStatus.value = data.recognition_status || 'waiting';
+      weightStable.value = Boolean(data.weight_stable);
+
+      if (recognitionStatus.value === 'multi_item_error' || data.status === 'multi_item_error') {
         hasMultiItemError.value = true;
         multiItemMessage.value = data.message || '检测到多种果蔬，请一次仅放置一种商品称重';
         currentDetected.value = null;
+      } else if (data.stable_result) {
+        hasMultiItemError.value = false;
+        multiItemMessage.value = '';
+        recognitionHint.value = '';
+        parseStableResult(data.stable_result, realWeight);
       } else {
         hasMultiItemError.value = false;
         multiItemMessage.value = '';
-        parseCurrentItem(data.items, realWeight);
+        currentDetected.value = null;
+        recognitionHint.value = getRecognitionHint(data);
       }
 
       if (data.status === 'alert') {
@@ -321,6 +333,7 @@ const toggleRecognition = async () => {
         showTerminalCheatAlert.value = true;
         isRecognizing.value = false;
         currentDetected.value = null;
+        weightStable.value = false;
         if (ws === socket) {
           ws = null;
         }
@@ -345,23 +358,29 @@ const toggleRecognition = async () => {
     currentDetected.value = null;
     hasMultiItemError.value = false;
     multiItemMessage.value = '';
+    recognitionStatus.value = 'waiting';
+    recognitionHint.value = '请将果蔬放置在摄像头下与秤台上...';
+    weightStable.value = false;
   }
 };
 
-const parseCurrentItem = (items, currentWeight) => {
-  if (!items || items.length === 0) {
+const getRecognitionHint = (data) => {
+  if (data.recognition_status === 'low_confidence') {
+    return '识别置信度较低，请调整商品位置或光照';
+  }
+  if (!data.weight_stable) {
+    return '正在稳定称重';
+  }
+  return data.recognition_message || '正在确认商品类别，请保持商品静止';
+};
+
+const parseStableResult = (item, currentWeight) => {
+  if (!item) {
     currentDetected.value = null;
     return;
   }
 
-  let bestItem = items[0];
-  for (let i = 1; i < items.length; i++) {
-    if (items[i].conf > bestItem.conf) {
-      bestItem = items[i];
-    }
-  }
-
-  let label = bestItem.label;
+  let label = item.label;
   let displayName = label;
   let freshness = '未知';
   let unitPrice = 0;
@@ -387,6 +406,11 @@ const parseCurrentItem = (items, currentWeight) => {
 const addToCart = () => {
   if (hasMultiItemError.value) {
     alert('检测到多种果蔬，请一次仅放置一种商品称重');
+    return;
+  }
+
+  if (!weightStable.value) {
+    alert('正在稳定称重，请稍候');
     return;
   }
 

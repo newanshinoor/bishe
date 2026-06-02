@@ -31,6 +31,7 @@ from core.detector_4d import FruitDetector4D, analyze_detected_items
 from core.alarm_log import AlarmLog
 from core.database import SessionLocal
 from core.order_video import cache_order_video_frame
+from core.recognition_stabilizer import FruitDetectionStabilizer
 from core.realtime_anti_cheat import RealtimeOcclusionGuard, RealtimeWeightGuard
 from core.scale_driver import RealTimeScale
 from core.system_config import get_runtime_config
@@ -320,18 +321,10 @@ def _save_alarm_clip_and_insert_log(
 
 
 def _draw_detections(raw_img, detections: list[Dict[str, Any]]):
-    """
-    按原有逻辑绘制 YOLO 检测框。
-
-    这里保留了原文件中把 rottenApple 篡改为 freshApple 的演示逻辑，
-    便于继续复现实验中的“换货/篡改标签”场景。
-    """
+    """绘制模型原始检测框，不修改模型输出标签。"""
     annotated_img = raw_img.copy()
 
     for item in detections:
-        if item["label"] == "rottenApple":
-            item["label"] = "freshApple"
-
         x1, y1, x2, y2 = item["bbox"]
         label_to_draw = item["label"]
         conf = item["conf"]
@@ -388,6 +381,7 @@ async def video_feed(websocket: WebSocket):
     # 每次重新点击“开始识别”都会建立新的 WebSocket。
     # 对齐窗口必须属于当前连接，不能复用上一次作弊发生时残留的 60 帧。
     session_aligner = DataAligner(window_size=ALIGN_WINDOW_SIZE)
+    fruit_stabilizer = FruitDetectionStabilizer()
     weight_guard = RealtimeWeightGuard()
     occlusion_guard = RealtimeOcclusionGuard(
         ratio_threshold=OCCLUSION_RATIO_THRESHOLD,
@@ -427,6 +421,9 @@ async def video_feed(websocket: WebSocket):
             # 二者都在当前帧周期内完成，并立即送入 aligner 形成同步滑窗。
             vision_features = vision.extract_features(color)
             raw_weight, weight_diff = scale.get_features()
+            if camera.is_mock and not scale.connected:
+                raw_weight = float(os.getenv("MOCK_WEIGHT_GRAMS", "500"))
+                weight_diff = 0.0
             session_aligner.update(vision_features, [raw_weight, weight_diff])
 
             # 论文中的部分遮挡特征为 ROI 内关键点数量 / 21。
@@ -566,6 +563,13 @@ async def video_feed(websocket: WebSocket):
                 detections,
                 confidence_threshold=runtime_config.min_confidence_threshold,
             )
+            recognition = fruit_stabilizer.update(
+                item_analysis["effective_detections"],
+                raw_weight,
+                now=monotonic(),
+                item_status=item_analysis["status"],
+                item_message=item_analysis["message"],
+            )
 
             # 多种果蔬混放时停止计价：前端只收到空 items，不会继续按最高置信度商品计价。
             # 多个同类框则继续使用有效框，由前端按最高置信度框确定商品名称，
@@ -607,6 +611,12 @@ async def video_feed(websocket: WebSocket):
             # 9. WebSocket 前端展示使用 kg；LSTM 模型仍使用 raw_weight(g)。
             # max 用于抑制电子秤轻微漂移产生的负数。
             weight_kg = max(0.0, raw_weight / 1000.0)
+            stable_result = recognition["stable_result"]
+            if stable_result is not None:
+                stable_result = {
+                    **stable_result,
+                    "weight": weight_kg,
+                }
 
             # 10. 编码当前帧为 base64 jpg，沿用原来的前端消费格式。
             _, buffer = cv2.imencode(".jpg", annotated_img)
@@ -619,8 +629,17 @@ async def video_feed(websocket: WebSocket):
             message = {
                 "image": jpg_text,
                 "items": pricing_items,
+                "stable_result": stable_result,
                 "weight": weight_kg,
                 "status": security_signal["status"],
+                "recognition_status": recognition["status"],
+                "recognition_message": recognition["message"],
+                "weight_stable": recognition["weight_stable"],
+                "recognition_vote_ratio": recognition["vote_ratio"],
+                "recognition_average_confidence": recognition["average_confidence"],
+                "recognition_sample_count": recognition["sample_count"],
+                "inference_mode": detector.last_inference_mode,
+                "camera_mode": camera.mode,
                 "item_status": item_analysis["status"],
                 "error_code": item_analysis["error_code"],
                 "message": item_analysis["message"],
@@ -652,5 +671,6 @@ async def video_feed(websocket: WebSocket):
     finally:
         # 显式释放当前连接的历史帧，重新开始识别时必须重新采样完整窗口。
         session_aligner.reset()
+        fruit_stabilizer.reset()
         weight_guard.reset()
         occlusion_guard.reset()
