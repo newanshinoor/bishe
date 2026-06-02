@@ -1,6 +1,7 @@
 import torch
 import cv2
 import numpy as np
+import re
 from ultralytics import YOLO
 from ultralytics.nn.tasks import DetectionModel
 
@@ -13,6 +14,70 @@ def patched_init(self, cfg='yolov8n.yaml', ch=3, *args, **kwargs):
 
 
 DetectionModel.__init__ = patched_init
+
+
+# 低置信度目标不参与“是否混放多种果蔬”的业务判断。
+# YOLO 仍会保留原始检测框用于画面调试，计价只使用达到该阈值的有效框。
+MULTI_ITEM_CONFIDENCE_THRESHOLD = 0.60
+
+
+def normalize_product_category(label):
+    """
+    将 YOLO 类别名归一化为基础果蔬品类。
+
+    模型类别通常包含新鲜度前缀，例如 freshApple、rottenApple、blemishApple。
+    称重业务只关心是否为同一种果蔬，因此这些标签都应归一化为 apple。
+    """
+    normalized = re.sub(r"[^0-9a-z]+", "", str(label or "").lower())
+    normalized = re.sub(r"(fresh|rotten|blemish)", "", normalized)
+    return normalized or "unknown"
+
+
+def analyze_detected_items(detections, confidence_threshold=MULTI_ITEM_CONFIDENCE_THRESHOLD):
+    """
+    分析有效检测框是否包含多种果蔬。
+
+    返回结构会直接进入 WebSocket 消息：
+    - normal: 0 或 1 个有效框；
+    - same_category_multiple: 多个同品类框，按同一商品合并称重；
+    - multi_item_error: 同时存在至少两种品类，停止计价。
+    """
+    effective_detections = [
+        item.copy()
+        for item in detections
+        if float(item.get("conf", 0.0)) >= confidence_threshold
+    ]
+    categories = sorted({
+        normalize_product_category(item.get("label"))
+        for item in effective_detections
+    })
+
+    result = {
+        "status": "normal",
+        "error_code": None,
+        "message": "",
+        "confidence_threshold": confidence_threshold,
+        "valid_detection_count": len(effective_detections),
+        "detected_categories": categories,
+        "effective_detections": effective_detections,
+        "pricing_mode": "single_item",
+    }
+
+    if len(effective_detections) > 1 and len(categories) > 1:
+        result.update({
+            "status": "multi_item_error",
+            "error_code": "MULTI_ITEM_ERROR",
+            "message": "检测到多种果蔬，请一次仅放置一种商品称重",
+            "pricing_mode": "blocked",
+        })
+    elif len(effective_detections) > 1:
+        result.update({
+            "status": "same_category_multiple",
+            "message": "检测到多个同类目标，已按同一种商品合并称重",
+            "pricing_mode": "merge_same_category",
+        })
+
+    return result
 
 
 class FruitDetector4D:

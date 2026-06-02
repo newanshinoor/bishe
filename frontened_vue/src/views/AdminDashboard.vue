@@ -3,11 +3,12 @@
     <aside class="sidebar">
       <h2 class="logo">系统运营后台</h2>
       <ul class="nav-menu">
-        <li :class="{ active: activeTab === 'dashboard' }" @click="switchTab('dashboard')">销量预测</li>
-        <li :class="{ active: activeTab === 'commodities' }" @click="switchTab('commodities')">商品管理</li>
-        <li :class="{ active: activeTab === 'orders' }" @click="switchTab('orders')">订单流水记录</li>
+        <li :class="{ active: activeTab === 'dashboard' }" @click="switchTab('dashboard')">📈 销量预测</li>
+        <li :class="{ active: activeTab === 'commodities' }" @click="switchTab('commodities')">📦 商品管理</li>
+        <li :class="{ active: activeTab === 'orders' }" @click="switchTab('orders')">🧾 订单流水记录</li>
         <li :class="{ active: activeTab === 'alarms' }" @click="switchTab('alarms')">🚨 违规报警日志</li>
-        <li :class="{ active: activeTab === 'monitor' }" @click="switchTab('monitor')">数字大屏(新)</li>
+        <li :class="{ active: activeTab === 'settings' }" @click="switchTab('settings')">⚙️ 防作弊参数设置</li>
+        <li :class="{ active: activeTab === 'monitor' }" @click="switchTab('monitor')">🖥️ 数字大屏</li>
       </ul>
     </aside>
 
@@ -16,7 +17,8 @@
         <h1>
           {{ activeTab === 'dashboard' ? '销售与运营仪表盘' :
              activeTab === 'commodities' ? '商品档案与库存管理' :
-             activeTab === 'alarms' ? 'LSTM 监控报警中心' : '订单流水与异常行为检测' }}
+             activeTab === 'alarms' ? 'LSTM 监控报警中心' :
+             activeTab === 'settings' ? '防作弊参数设置' : '订单流水与异常行为检测' }}
         </h1>
         <div class="user-info">管理员：饶程</div>
       </header>
@@ -41,6 +43,11 @@
               <div class="price-compare">
                 <span class="old-price">当前价: ¥{{ currentPricingItem.base_price }}</span>
                 <span class="new-price">AI建议价: ¥{{ currentPricingItem.suggested_price }}</span>
+              </div>
+              <div class="pricing-metrics">
+                <span>成本价: ¥{{ currentPricingItem.cost_price }}</span>
+                <span>止损底价: ¥{{ currentPricingItem.floor_price }}</span>
+                <span>最大预测销量: {{ currentPricingItem.predicted_sales }} kg</span>
               </div>
               <p class="reason">{{ currentPricingItem.reason }}</p>
               <div class="price-adjust">
@@ -67,12 +74,13 @@
           </div>
           <table class="styled-table">
             <thead>
-              <tr><th>商品名称</th><th>基础定价 (¥/kg)</th><th>当前库存 (kg)</th><th>新鲜度 (0-1)</th><th>库存状态</th><th>操作</th></tr>
+              <tr><th>商品名称</th><th>基础售价 (¥/kg)</th><th>成本价 (¥/kg)</th><th>当前库存 (kg)</th><th>新鲜度 (0-1)</th><th>库存状态</th><th>操作</th></tr>
             </thead>
             <tbody>
               <tr v-for="item in commodityList" :key="item.item_name">
                 <td style="font-weight: bold;">{{ item.item_name }}</td>
                 <td>¥{{ item.price.toFixed(2) }}</td>
+                <td>¥{{ item.cost_price.toFixed(2) }}</td>
                 <td>{{ item.inventory.toFixed(2) }} kg</td>
                 <td><div class="progress-bar"><div class="progress-fill" :style="{ width: (item.freshness * 100) + '%', backgroundColor: item.freshness > 0.6 ? '#4CAF50' : '#f44336' }"></div></div>{{ item.freshness.toFixed(2) }}</td>
                 <td><span class="stock-badge" :class="item.inventory > 20 ? 'stock-ok' : 'stock-low'">{{ item.inventory > 20 ? '库存充足' : '需尽快补货' }}</span></td>
@@ -87,26 +95,75 @@
         <div class="table-card">
           <div class="table-header-actions">
             <h3>无人货柜交易流水记录</h3>
-            <div class="filter-actions">
-              <label style="margin-right: 10px; font-size: 14px; font-weight: bold;">防作弊行为筛选：</label>
-              <select v-model="filterTag" @change="fetchOrders" class="tag-select">
-                <option value="">全部流水</option><option value="0">✅ 正常交易</option><option value="1">⚠️ 换货作弊</option><option value="2">🚫 遮挡作弊</option>
-              </select>
-              <button class="btn-success" @click="fetchOrders">↻ 刷新</button>
-            </div>
+            <button class="btn-success" @click="fetchOrders()">↻ 刷新数据</button>
           </div>
-          <table class="styled-table">
-            <thead><tr><th>流水单号 (UUID)</th><th>商品名称</th><th>计费重量</th><th>顾客实付</th><th>预估利润</th><th>防作弊行为标签</th><th>入库时间</th><th>操作</th></tr></thead>
-            <tbody>
-              <tr v-for="order in orderList" :key="order.transaction_id">
-                <td class="font-mono text-xs">{{ order.transaction_id }}</td><td style="font-weight: bold;">{{ order.product_name }}</td><td class="text-weight">{{ order.total_amount.toFixed(2) }} kg</td><td class="text-price">¥{{ order.pay_amount.toFixed(2) }}</td><td style="color: #52c41a;">¥{{ order.profit.toFixed(2) }}</td>
-                <td><span :class="['status-tag', getTagClass(order.tag)]">{{ getTagText(order.tag) }}</span></td>
-                <td style="color: #888; font-size: 13px;">{{ order.creat_at }}</td>
-                <td><div class="action-buttons"><button v-if="order.tag !== 0" class="btn-action success" @click="updateTag(order.transaction_id, 0)">复核正常</button><button v-if="order.tag === 0" class="btn-action warn" @click="updateTag(order.transaction_id, 1)">标异常</button><button class="btn-action danger" @click="deleteOrder(order.transaction_id)">删除</button></div></td>
-              </tr>
-              <tr v-if="orderList.length === 0"><td colspan="8" style="text-align: center; padding: 40px; color: #999;">暂无数据</td></tr>
-            </tbody>
-          </table>
+          <div class="order-toolbar">
+            <input v-model.trim="orderFilters.product_name" type="text" placeholder="请输入商品名" @input="resetOrderPage" @keyup.enter="fetchOrders({ resetPage: true })" />
+            <select v-model="orderFilters.anti_cheat_tag" @change="resetOrderPage">
+              <option value="all">全部流水</option>
+              <option value="normal">正常</option>
+              <option value="abnormal">异常</option>
+              <option value="swap">快速替换</option>
+              <option value="occlusion">部分遮挡</option>
+              <option value="lift">恶意托底</option>
+            </select>
+            <select v-model="orderFilters.manual_check_status" @change="resetOrderPage">
+              <option value="">全部巡查状态</option>
+              <option value="unchecked">未巡查</option>
+              <option value="normal">已标正常</option>
+              <option value="abnormal">已标异常</option>
+            </select>
+            <select v-model="orderFilters.sort_by" @change="resetOrderPage">
+              <option value="created_at">入库时间</option>
+              <option value="weight">计费重量</option>
+              <option value="paid_amount">顾客实付</option>
+              <option value="profit">预计利润</option>
+            </select>
+            <select v-model="orderFilters.sort_order" @change="resetOrderPage">
+              <option value="desc">降序</option>
+              <option value="asc">升序</option>
+            </select>
+            <button class="btn-query" @click="fetchOrders({ resetPage: true })">查询</button>
+            <button class="btn-reset" @click="resetOrderFilters">重置</button>
+          </div>
+          <div class="order-table-scroll">
+            <table class="styled-table">
+              <thead><tr><th>流水单号 (UUID)</th><th>商品名称</th><th>计费重量</th><th>顾客实付</th><th>预估利润</th><th>防作弊行为标签</th><th>人工巡查状态</th><th>入库时间</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr v-for="order in orderList" :key="order.transaction_id">
+                  <td class="font-mono text-xs">{{ order.transaction_id }}</td>
+                  <td style="font-weight: bold;">{{ order.product_name }}</td>
+                  <td class="text-weight">{{ formatNumber(order.weight) }} kg</td>
+                  <td class="text-price">¥{{ formatNumber(order.paid_amount) }}</td>
+                  <td style="color: #52c41a;">¥{{ formatNumber(order.profit) }}</td>
+                  <td><span :class="['status-tag', getAntiCheatTagClass(order.anti_cheat_tag)]">{{ getAntiCheatTagText(order.anti_cheat_tag) }}</span></td>
+                  <td><span :class="['status-tag', getManualCheckClass(order.manual_check_status)]">{{ getManualCheckText(order.manual_check_status) }}</span></td>
+                  <td style="color: #888; font-size: 13px;">{{ order.created_at }}</td>
+                  <td>
+                    <div class="action-buttons">
+                      <button class="btn-action video" :disabled="!order.payment_before_video_url" :title="order.payment_before_video_url ? '查看支付前视频' : '该订单暂无视频'" @click="openOrderVideo(order)">查看视频</button>
+                      <button class="btn-action success" @click="markOrderNormal(order)">标正常</button>
+                      <button class="btn-action warn" @click="openAbnormalCheck(order)">标异常</button>
+                      <button class="btn-action danger" @click="deleteOrder(order.transaction_id)">删除</button>
+                    </div>
+                  </td>
+                </tr>
+                <tr v-if="!orderLoading && orderList.length === 0"><td colspan="9" style="text-align: center; padding: 40px; color: #999;">暂无数据</td></tr>
+                <tr v-if="orderLoading"><td colspan="9" style="text-align: center; padding: 40px; color: #999;">正在加载...</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="order-pagination">
+            <span>共 {{ orderPagination.total }} 条</span>
+            <select v-model.number="orderPagination.page_size" @change="handleOrderPageSizeChange">
+              <option :value="10">10 条/页</option>
+              <option :value="20">20 条/页</option>
+              <option :value="50">50 条/页</option>
+            </select>
+            <button :disabled="orderPagination.page <= 1" @click="changeOrderPage(orderPagination.page - 1)">上一页</button>
+            <span>第 {{ orderPagination.page }} / {{ orderPageCount }} 页</span>
+            <button :disabled="orderPagination.page >= orderPageCount" @click="changeOrderPage(orderPagination.page + 1)">下一页</button>
+          </div>
         </div>
       </div>
 
@@ -156,6 +213,47 @@
               </tr>
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <div v-if="activeTab === 'settings'" class="tab-content">
+        <div class="table-card config-panel">
+          <div class="config-heading">
+            <div>
+              <h3>防作弊策略阈值</h3>
+              <p>修改后会立即下发到柜端实时识别循环，无需重启服务。</p>
+            </div>
+            <button class="btn-config-refresh" @click="fetchAntiCheatConfig">刷新当前值</button>
+          </div>
+
+          <div class="config-grid">
+            <label class="config-field">
+              <span>LSTM 告警置信度阈值</span>
+              <input v-model.number="antiCheatConfig.anti_cheat_threshold" type="number" min="0" max="1" step="0.01" />
+              <small>范围 0 到 1。降低后更敏感，提高后误报更少。</small>
+            </label>
+
+            <label class="config-field">
+              <span>遮挡持续时间阈值</span>
+              <input v-model.number="antiCheatConfig.occlusion_duration_threshold" type="number" min="0.1" step="0.1" />
+              <small>单位：秒。手部关键点在 ROI 内持续超过该时间才报警。</small>
+            </label>
+
+            <label class="config-field">
+              <span>YOLO 有效框置信度阈值</span>
+              <input v-model.number="antiCheatConfig.min_confidence_threshold" type="number" min="0" max="1" step="0.01" />
+              <small>范围 0 到 1。低于该值的目标不参与多商品判断。</small>
+            </label>
+          </div>
+
+          <p v-if="configError" class="config-message error">{{ configError }}</p>
+          <p v-if="configSuccess" class="config-message success">{{ configSuccess }}</p>
+
+          <div class="config-actions">
+            <button class="btn-save" :disabled="configSaving" @click="saveAntiCheatConfig">
+              {{ configSaving ? '保存中...' : '保存并立即生效' }}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -229,6 +327,41 @@
       </div>
     </main>
 
+    <el-dialog v-model="showOrderVideoDialog" title="支付前 8 秒订单视频" width="760px" @closed="closeOrderVideo">
+      <video
+        v-if="currentOrderVideoUrl"
+        ref="orderVideoRef"
+        class="order-video-player"
+        :src="currentOrderVideoUrl"
+        controls
+        preload="metadata"
+        @loadedmetadata="orderVideoError = ''"
+        @error="orderVideoError = '视频加载失败，请确认视频文件仍然存在。'"
+      ></video>
+      <p v-if="orderVideoError" class="evidence-error">{{ orderVideoError }}</p>
+      <template #footer>
+        <button class="btn-cancel" @click="showOrderVideoDialog = false">关闭</button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="showAbnormalCheckDialog" title="标记异常订单" width="520px">
+      <div class="abnormal-check-form">
+        <label>异常类型</label>
+        <select v-model="abnormalCheckForm.anti_cheat_tag">
+          <option value="abnormal">其他异常</option>
+          <option value="swap">快速替换</option>
+          <option value="occlusion">部分遮挡</option>
+          <option value="lift">恶意托底</option>
+        </select>
+        <label>管理员备注</label>
+        <textarea v-model.trim="abnormalCheckForm.note" maxlength="500" rows="4" placeholder="请输入巡查备注"></textarea>
+      </div>
+      <template #footer>
+        <button class="btn-cancel" @click="showAbnormalCheckDialog = false">取消</button>
+        <button class="btn-action warn" :disabled="manualCheckSaving" @click="submitAbnormalCheck">确认标异常</button>
+      </template>
+    </el-dialog>
+
     <div class="cheat-alert-backdrop" v-if="showCheatAlertModal && latestAlarm">
       <div class="cheat-alert-panel">
         <div class="cheat-alert-header">
@@ -252,7 +385,7 @@
             </div>
             <div class="cheat-alert-row">
               <span>模型置信度</span>
-              <strong class="score-text">{{ Number(latestAlarm.lstm_score || 0).toFixed(2) }} <em>(阈值: 0.85)</em></strong>
+              <strong class="score-text">{{ Number(latestAlarm.lstm_score || 0).toFixed(2) }} <em>(阈值: {{ Number(antiCheatConfig.anti_cheat_threshold).toFixed(2) }})</em></strong>
             </div>
           </div>
 
@@ -292,6 +425,7 @@
       <div class="modal-box">
         <h3>管理商品：{{ editForm.item_name }}</h3>
         <div class="form-group"><label>基础售价 (¥/kg):</label><input type="number" v-model.number="editForm.price" step="0.5" /></div>
+        <div class="form-group"><label>成本价 (¥/kg):</label><input type="number" v-model.number="editForm.cost_price" min="0" step="0.1" /></div>
         <div class="form-group"><label>当前库存 (kg):</label><input type="number" v-model.number="editForm.inventory" step="5" /></div>
         <div class="form-group"><label>新鲜度 (0.00-1.00):</label><input type="number" v-model.number="editForm.freshness" step="0.05" /></div>
         <div class="modal-actions"><button class="btn-cancel" @click="showEditModal = false">取消</button><button class="btn-save" @click="saveCommodity">保存</button></div>
@@ -303,7 +437,13 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, shallowRef, nextTick, computed } from 'vue';
 import * as echarts from 'echarts';
-import api from '../utils/api';
+import { ElDialog, ElMessage } from 'element-plus';
+import 'element-plus/dist/index.css';
+import api, {
+  getAdminTransactions,
+  getTransactionVideoUrl,
+  updateTransactionManualCheck
+} from '../utils/api';
 
 onMounted(() => {
   window.tailwind = { corePlugins: { preflight: false } };
@@ -324,9 +464,25 @@ const pricingList = ref([]);
 const selectedFruit = ref(null);
 const commodityList = ref([]);
 const showEditModal = ref(false);
-const editForm = ref({ item_name: '', price: 0, inventory: 0, freshness: 0 });
+const editForm = ref({ item_name: '', price: 0, cost_price: 0, inventory: 0, freshness: 0 });
 const orderList = ref([]);
-const filterTag = ref('');
+const orderLoading = ref(false);
+const orderFilters = ref({
+  product_name: '',
+  anti_cheat_tag: 'all',
+  manual_check_status: '',
+  sort_by: 'created_at',
+  sort_order: 'desc'
+});
+const orderPagination = ref({ page: 1, page_size: 10, total: 0 });
+const orderPageCount = computed(() => Math.max(1, Math.ceil(orderPagination.value.total / orderPagination.value.page_size)));
+const showOrderVideoDialog = ref(false);
+const currentOrderVideoUrl = ref('');
+const orderVideoError = ref('');
+const orderVideoRef = ref(null);
+const showAbnormalCheckDialog = ref(false);
+const abnormalCheckForm = ref({ transaction_id: '', anti_cheat_tag: 'abnormal', note: '' });
+const manualCheckSaving = ref(false);
 
 // ========== 🌟 新增：报警日志状态 ==========
 const alarmList = ref([]);
@@ -340,6 +496,16 @@ const latestAlarm = ref(null);
 const lastSeenAlarmLogId = ref(0);
 const alarmBaselineReady = ref(false);
 let alarmPollingTimer = null;
+
+// ========== 防作弊阈值配置 ==========
+const antiCheatConfig = ref({
+  anti_cheat_threshold: 0.85,
+  occlusion_duration_threshold: 5.0,
+  min_confidence_threshold: 0.60
+});
+const configError = ref('');
+const configSuccess = ref('');
+const configSaving = ref(false);
 
 // ========== 大屏状态 ==========
 const monitorData = ref({ today_sales: 0, today_orders: 0, alerts: [], pricing: [], history_chart: null });
@@ -365,8 +531,56 @@ const switchTab = async (tabName) => {
   } else if (tabName === 'alarms') {
     // 🌟 触发获取报警日志
     fetchAlarms();
+  } else if (tabName === 'settings') {
+    fetchAntiCheatConfig();
   } else if (tabName === 'monitor') {
     await nextTick(); fetchMonitorData();
+  }
+};
+
+const validateAntiCheatConfig = () => {
+  const config = antiCheatConfig.value;
+  if (config.anti_cheat_threshold < 0 || config.anti_cheat_threshold > 1) {
+    return 'LSTM 告警置信度阈值必须在 0 到 1 之间。';
+  }
+  if (config.occlusion_duration_threshold <= 0) {
+    return '遮挡持续时间阈值必须大于 0 秒。';
+  }
+  if (config.min_confidence_threshold < 0 || config.min_confidence_threshold > 1) {
+    return 'YOLO 有效框置信度阈值必须在 0 到 1 之间。';
+  }
+  return '';
+};
+
+const fetchAntiCheatConfig = async () => {
+  configError.value = '';
+  try {
+    const res = await api.get('/admin/config/anti-cheat');
+    if (res.data.status === 'success') {
+      antiCheatConfig.value = { ...res.data.data };
+    }
+  } catch (error) {
+    configError.value = error.response?.data?.detail || '读取防作弊配置失败，请确认后端服务正常运行。';
+  }
+};
+
+const saveAntiCheatConfig = async () => {
+  configError.value = validateAntiCheatConfig();
+  configSuccess.value = '';
+  if (configError.value) return;
+
+  configSaving.value = true;
+  try {
+    const res = await api.put('/admin/config/anti-cheat', antiCheatConfig.value);
+    antiCheatConfig.value = { ...res.data.data };
+    configSuccess.value = res.data.message || '防作弊阈值已保存并实时生效。';
+  } catch (error) {
+    const detail = error.response?.data?.detail;
+    configError.value = Array.isArray(detail)
+      ? detail.map(item => item.msg).join('；')
+      : detail || '保存失败，请检查输入值。';
+  } finally {
+    configSaving.value = false;
   }
 };
 
@@ -503,20 +717,159 @@ const initMonitorChart = () => { if (monitorChartRef.value && !monitorChartInsta
 const updateMonitorChart = () => { if (!monitorChartInstance || !monitorData.value.history_chart) return; const chartData = monitorData.value.history_chart[currentFruitKey.value][currentTimeType.value]; const fName = currentFruitKey.value === 'all' ? '全部品类' : currentFruitKey.value; monitorChartInstance.setOption({ xAxis: { data: chartData.x }, legend: { data: [fName + ' 历史真实销量(kg)'], textStyle: { color: '#9ca3af' }, top: 0 }, series: [{ name: fName + ' 历史真实销量(kg)', data: chartData.y }] }); };
 const changeTimeType = (type) => { currentTimeType.value = type; updateMonitorChart(); };
 const timeBtnClass = (type) => type === currentTimeType.value ? 'px-3 py-1 bg-blue-600 text-white rounded text-xs transition' : 'px-3 py-1 bg-transparent text-gray-400 hover:text-white rounded text-xs transition';
-const applyNewPrice = (item) => { alert(`成功干预！${item.name} 价格已下放至秤端系统：¥${item.new_price}`); };
+const applyNewPrice = async (item) => {
+  try {
+    await api.post('/update_price', { item_name: item.name, new_price: Number(item.new_price) });
+    alert(`成功干预！${item.name} 价格已下放至秤端系统：¥${item.new_price}`);
+    await Promise.all([fetchMonitorData(), fetchDashboardData(), fetchCommodities()]);
+  } catch (error) {
+    alert(error.response?.data?.detail || '下发价格失败，请检查后端服务。');
+  }
+};
 
 const togglePricingCard = (n) => { selectedFruit.value = selectedFruit.value === n ? null : n; };
 const renderChart = (dates, predictions) => { if (!chartRef.value) return; if (!chartInstance.value) chartInstance.value = echarts.init(chartRef.value); const seriesData = Object.keys(predictions).map(f => ({ name: f, type: 'line', smooth: true, data: predictions[f], itemStyle: { borderWidth: 2 } })); chartInstance.value.setOption({ tooltip: { trigger: 'axis' }, legend: { data: Object.keys(predictions), top: 0 }, grid: { left: '3%', right: '4%', bottom: '15%', containLabel: true }, dataZoom: [ { type: 'inside', start: 0, end: 100 }, { type: 'slider', start: 0, end: 100, bottom: 5 } ], xAxis: { type: 'category', boundaryGap: false, data: dates }, yAxis: { type: 'value', name: '预测销量 (kg)' }, series: seriesData }); };
 const fetchDashboardData = async () => { try { const r = await api.get('/dashboard/sales_and_pricing'); pricingList.value = r.data.pricing_strategy.map(i => ({ ...i, manualPrice: i.suggested_price })); renderChart(r.data.dates, r.data.sales_predictions); } catch(e){} };
-const applyPrice = async (item) => { try { await api.post('/update_price', { item_name: item.name, new_price: parseFloat(item.manualPrice) }); fetchDashboardData(); selectedFruit.value = null; } catch(e){} };
+const applyPrice = async (item) => {
+  try {
+    await api.post('/update_price', { item_name: item.name, new_price: parseFloat(item.manualPrice) });
+    fetchDashboardData();
+    selectedFruit.value = null;
+  } catch (error) {
+    alert(error.response?.data?.detail || '调价失败，请检查售价是否低于成本止损底价。');
+  }
+};
 const fetchCommodities = async () => { try { const r = await api.get('/commodities'); if (r.data.status === 'success') commodityList.value = r.data.data; } catch(e){} };
 const openEditModal = (item) => { editForm.value = { ...item }; showEditModal.value = true; };
-const saveCommodity = async () => { try { const r = await api.post('/update_commodity', editForm.value); if (r.data.status === 'success') { showEditModal.value = false; fetchCommodities(); } } catch(e){} };
-const getTagText = (tag) => tag === 0 ? '✅ 正常' : tag === 1 ? '⚠️ 换货' : '🚫 遮挡';
-const getTagClass = (tag) => tag === 0 ? 'normal' : tag === 1 ? 'anomaly-swap' : 'anomaly-occlusion';
-const fetchOrders = async () => { try { const url = filterTag.value !== '' ? `/transaction/list?tag=${filterTag.value}` : '/transaction/list'; const r = await api.get(url); if (r.data.status === 'success') orderList.value = r.data.data; } catch (e) {} };
-const updateTag = async (id, newTag) => { try { await api.put(`/transaction/${id}/tag`, { tag: newTag }); fetchOrders(); } catch(e){} };
-const deleteOrder = async (id) => { if (!confirm("删除不可恢复？")) return; try { await api.delete(`/transaction/${id}`); fetchOrders(); } catch(e){} };
+const saveCommodity = async () => {
+  if (Number(editForm.value.price) < Number(editForm.value.cost_price)) {
+    alert('基础售价不能低于成本价。');
+    return;
+  }
+  try {
+    const r = await api.post('/update_commodity', editForm.value);
+    if (r.data.status === 'success') {
+      showEditModal.value = false;
+      await Promise.all([fetchCommodities(), fetchDashboardData()]);
+    }
+  } catch (error) {
+    alert(error.response?.data?.detail || '保存商品信息失败。');
+  }
+};
+const formatNumber = (value) => Number(value || 0).toFixed(2);
+const getAntiCheatTagText = (tag) => ({
+  normal: '正常',
+  abnormal: '异常',
+  swap: '快速替换',
+  occlusion: '部分遮挡',
+  lift: '恶意托底'
+}[tag] || '未知');
+const getAntiCheatTagClass = (tag) => tag === 'normal' ? 'normal' : tag === 'swap' ? 'anomaly-swap' : 'anomaly-occlusion';
+const getManualCheckText = (status) => ({ unchecked: '未巡查', normal: '已标正常', abnormal: '已标异常' }[status] || '未巡查');
+const getManualCheckClass = (status) => status === 'normal' ? 'normal' : status === 'abnormal' ? 'anomaly-occlusion' : 'unchecked';
+const fetchOrders = async ({ resetPage = false } = {}) => {
+  if (resetPage) orderPagination.value.page = 1;
+  orderLoading.value = true;
+  try {
+    const params = {
+      ...orderFilters.value,
+      page: orderPagination.value.page,
+      page_size: orderPagination.value.page_size
+    };
+    if (!params.manual_check_status) delete params.manual_check_status;
+    const r = await getAdminTransactions(params);
+    orderList.value = r.data.items || [];
+    orderPagination.value.total = Number(r.data.total || 0);
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '获取订单流水失败');
+  } finally {
+    orderLoading.value = false;
+  }
+};
+const resetOrderFilters = () => {
+  orderFilters.value = {
+    product_name: '',
+    anti_cheat_tag: 'all',
+    manual_check_status: '',
+    sort_by: 'created_at',
+    sort_order: 'desc'
+  };
+  fetchOrders({ resetPage: true });
+};
+const resetOrderPage = () => {
+  orderPagination.value.page = 1;
+};
+const changeOrderPage = (page) => {
+  if (page < 1 || page > orderPageCount.value) return;
+  orderPagination.value.page = page;
+  fetchOrders();
+};
+const handleOrderPageSizeChange = () => fetchOrders({ resetPage: true });
+const openOrderVideo = (order) => {
+  if (!order.payment_before_video_url) {
+    ElMessage.warning('该订单暂无视频');
+    return;
+  }
+  orderVideoError.value = '';
+  currentOrderVideoUrl.value = `${getTransactionVideoUrl(order.transaction_id, order.payment_before_video_url)}?t=${Date.now()}`;
+  showOrderVideoDialog.value = true;
+};
+const closeOrderVideo = () => {
+  if (orderVideoRef.value) {
+    orderVideoRef.value.pause();
+    orderVideoRef.value.removeAttribute('src');
+    orderVideoRef.value.load();
+  }
+  currentOrderVideoUrl.value = '';
+  orderVideoError.value = '';
+};
+const markOrderNormal = async (order) => {
+  try {
+    await updateTransactionManualCheck(order.transaction_id, {
+      status: 'normal',
+      anti_cheat_tag: 'normal',
+      note: '管理员人工复核正常'
+    });
+    ElMessage.success('已标记为正常');
+    await fetchOrders();
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '标记失败');
+  }
+};
+const openAbnormalCheck = (order) => {
+  abnormalCheckForm.value = { transaction_id: order.transaction_id, anti_cheat_tag: 'abnormal', note: '' };
+  showAbnormalCheckDialog.value = true;
+};
+const submitAbnormalCheck = async () => {
+  manualCheckSaving.value = true;
+  try {
+    await updateTransactionManualCheck(abnormalCheckForm.value.transaction_id, {
+      status: 'abnormal',
+      anti_cheat_tag: abnormalCheckForm.value.anti_cheat_tag,
+      note: abnormalCheckForm.value.note
+    });
+    showAbnormalCheckDialog.value = false;
+    ElMessage.success('异常标记已保存');
+    await fetchOrders();
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '异常标记失败');
+  } finally {
+    manualCheckSaving.value = false;
+  }
+};
+const deleteOrder = async (id) => {
+  if (!confirm("删除不可恢复？")) return;
+  try {
+    await api.delete(`/transaction/${id}`);
+    ElMessage.success('订单流水已删除');
+    if (orderList.value.length === 1 && orderPagination.value.page > 1) {
+      orderPagination.value.page -= 1;
+    }
+    await fetchOrders();
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '删除失败');
+  }
+};
 
 const handleResize = () => {
   if (chartInstance.value && activeTab.value === 'dashboard') chartInstance.value.resize();
@@ -526,12 +879,14 @@ const handleResize = () => {
 onMounted(() => {
   fetchDashboardData();
   fetchAlarms();
+  fetchAntiCheatConfig();
   startAlarmPolling();
   window.addEventListener('resize', handleResize);
 });
 
 onBeforeUnmount(() => {
   if (alarmPollingTimer) clearInterval(alarmPollingTimer);
+  closeOrderVideo();
   window.removeEventListener('resize', handleResize);
 });
 </script>
@@ -551,6 +906,23 @@ onBeforeUnmount(() => {
 .top-nav h1 { margin: 0; font-size: 20px; color: #333;}
 .user-info { font-weight: bold; color: #1890ff; }
 .tab-content { display: flex; flex-direction: column; flex: 1;}
+
+.config-panel { max-width: 980px; }
+.config-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
+.config-heading h3 { margin: 0; color: #333; }
+.config-heading p { margin: 7px 0 0; color: #888; font-size: 13px; }
+.config-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.config-field { display: flex; flex-direction: column; gap: 9px; padding: 16px; border: 1px solid #e8e8e8; border-radius: 6px; background: #fafafa; }
+.config-field span { color: #333; font-size: 14px; font-weight: 700; }
+.config-field input { width: 100%; padding: 10px 12px; border: 1px solid #d9d9d9; border-radius: 5px; background: #fff; font-size: 16px; outline: none; }
+.config-field input:focus { border-color: #1890ff; box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.15); }
+.config-field small { color: #888; font-size: 12px; line-height: 1.55; }
+.config-actions { display: flex; justify-content: flex-end; margin-top: 20px; }
+.config-message { margin: 16px 0 0; padding: 10px 12px; border-radius: 5px; font-size: 13px; }
+.config-message.error { border: 1px solid #ffa39e; background: #fff1f0; color: #cf1322; }
+.config-message.success { border: 1px solid #b7eb8f; background: #f6ffed; color: #389e0d; }
+.btn-config-refresh { padding: 8px 14px; border: 1px solid #1890ff; border-radius: 4px; background: #fff; color: #1890ff; cursor: pointer; font-weight: 700; }
+.btn-config-refresh:hover { background: #e6f7ff; }
 
 /* 🌟 新增：违规监控弹窗专属样式 */
 .evidence-box {
@@ -788,6 +1160,8 @@ onBeforeUnmount(() => {
 .price-compare { display: flex; gap: 20px; margin-bottom: 12px; font-size: 16px;}
 .old-price { color: #888; text-decoration: line-through; }
 .new-price { color: #f5222d; font-weight: 900; font-size: 18px;}
+.pricing-metrics { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-bottom: 10px; color: #666; font-size: 13px; }
+.pricing-metrics span { padding: 4px 8px; border-radius: 4px; background: #f5f5f5; }
 .reason { margin: 0 0 15px 0; font-size: 14px; color: #666; background: #fafafa; padding: 12px; border-radius: 6px; border: 1px solid #eee; line-height: 1.5; }
 .price-adjust { display: flex; align-items: center; gap: 10px; }
 .currency { color: #666; font-weight: bold; font-size: 16px;}
@@ -834,17 +1208,41 @@ onBeforeUnmount(() => {
 .btn-save:hover { background: #40a9ff;}
 .filter-actions { display: flex; align-items: center;}
 .tag-select { padding: 6px 12px; border: 1px solid #d9d9d9; border-radius: 4px; outline: none; margin-right: 15px; font-size: 14px;}
+.order-toolbar { display: flex; flex-wrap: wrap; gap: 10px; padding: 14px; margin-bottom: 16px; border: 1px solid #e8e8e8; border-radius: 6px; background: #fafafa; }
+.order-table-scroll { overflow-x: auto; }
+.order-table-scroll .styled-table { min-width: 1240px; }
+.order-toolbar input, .order-toolbar select { min-width: 140px; padding: 8px 10px; border: 1px solid #d9d9d9; border-radius: 4px; background: #fff; color: #333; outline: none; }
+.order-toolbar input { min-width: 180px; }
+.order-toolbar input:focus, .order-toolbar select:focus { border-color: #1890ff; box-shadow: 0 0 0 2px rgba(24,144,255,0.12); }
+.btn-query, .btn-reset { padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+.btn-query { border: 1px solid #1890ff; background: #1890ff; color: #fff; }
+.btn-query:hover { background: #40a9ff; }
+.btn-reset { border: 1px solid #d9d9d9; background: #fff; color: #666; }
+.btn-reset:hover { color: #1890ff; border-color: #1890ff; }
+.order-pagination { display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 18px; color: #666; font-size: 13px; }
+.order-pagination select, .order-pagination button { padding: 6px 10px; border: 1px solid #d9d9d9; border-radius: 4px; background: #fff; color: #555; }
+.order-pagination button { cursor: pointer; }
+.order-pagination button:disabled { cursor: not-allowed; opacity: 0.45; }
+.abnormal-check-form { display: flex; flex-direction: column; gap: 10px; }
+.abnormal-check-form label { color: #555; font-size: 14px; font-weight: bold; }
+.abnormal-check-form select, .abnormal-check-form textarea { padding: 9px 10px; border: 1px solid #d9d9d9; border-radius: 4px; outline: none; font: inherit; }
+.abnormal-check-form textarea { resize: vertical; }
+.order-video-player { display: block; width: 100%; max-height: 65vh; border-radius: 6px; background: #111827; }
 .font-mono { font-family: monospace; color: #888;}
 .text-weight { color: #fa8c16; font-weight: bold;}
 .text-price { color: #cf1322; font-weight: bold;}
 .status-tag { padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; display: inline-block; }
 .status-tag.normal { background: #f6ffed; border: 1px solid #b7eb8f; color: #52c41a; }
+.status-tag.unchecked { background: #fafafa; border: 1px solid #d9d9d9; color: #8c8c8c; }
 .status-tag.anomaly-swap { background: #fffbe6; border: 1px solid #ffe58f; color: #faad14; }
 .status-tag.anomaly-occlusion { background: #fff1f0; border: 1px solid #ffa39e; color: #f5222d; }
-.action-buttons { display: flex; gap: 8px; }
+.action-buttons { display: flex; gap: 8px; white-space: nowrap; }
 .btn-action { padding: 5px 10px; border: none; border-radius: 4px; font-size: 12px; cursor: pointer; transition: 0.2s; font-weight: bold; }
 .btn-action.success { background: #52c41a; color: white; }
 .btn-action.success:hover { background: #73d13d; }
+.btn-action.video { background: #1890ff; color: white; }
+.btn-action.video:hover { background: #40a9ff; }
+.btn-action:disabled { cursor: not-allowed; opacity: 0.45; }
 .btn-action.warn { background: #fa8c16; color: white; }
 .btn-action.warn:hover { background: #ffc069; }
 .btn-action.danger { background: #ff4d4f; color: white; }

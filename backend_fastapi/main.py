@@ -11,7 +11,15 @@ from routers import commodity
 from routers import dashboard
 from routers import transaction
 from routers import payment
+from routers import sales_history
 from routers import video
+from routers import admin_config
+from routers import admin_transactions
+from core.database import engine
+from core.inventory_schema import ensure_inventory_schema
+from core.sales_history import ensure_sales_history_schema, sync_existing_transaction_sales_history
+from core.system_config import ensure_system_config
+from core.transaction_schema import ensure_transaction_schema
 
 # 1. 初始化 FastAPI 应用
 app = FastAPI(title="智能无人果蔬售卖系统 API", version="2.0 (模块化重构)")
@@ -21,6 +29,7 @@ app = FastAPI(title="智能无人果蔬售卖系统 API", version="2.0 (模块�
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(os.path.join(STATIC_DIR, "alarms"), exist_ok=True)
+os.makedirs(os.path.join(STATIC_DIR, "order_videos"), exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # 2. 配置跨域 (CORS)
@@ -38,7 +47,21 @@ app.include_router(commodity.router)
 app.include_router(dashboard.router)
 app.include_router(transaction.router)
 app.include_router(payment.router)
+app.include_router(sales_history.router)
 app.include_router(video.router)
+app.include_router(admin_config.router)
+app.include_router(admin_transactions.router)
+
+
+@app.on_event("startup")
+def initialize_system_config():
+    """启动时创建 system_config 表和默认配置记录。"""
+    ensure_system_config()
+    ensure_inventory_schema()
+    transaction.TransactionDB.__table__.create(bind=engine, checkfirst=True)
+    ensure_transaction_schema()
+    ensure_sales_history_schema()
+    sync_existing_transaction_sales_history()
 
 if __name__ == "__main__":
     import uvicorn

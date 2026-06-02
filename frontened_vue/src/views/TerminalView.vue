@@ -18,6 +18,7 @@
             :src="'data:image/jpeg;base64,' + currentImage"
             class="ws-video"
             alt="Camera Feed"
+            @load="syncVideoGeometry"
           />
           <div v-if="roiBox" class="roi-box" :style="roiBoxStyle"></div>
           <div v-if="roiDrawMode" class="roi-tip">ROI 标注模式：拖拽鼠标画框，按 2 保存</div>
@@ -26,7 +27,13 @@
           <div v-show="isRecognizing && !currentImage" class="offline-msg">正在连接后端深度相机...</div>
         </div>
 
-        <div class="current-item-panel" v-if="isRecognizing && currentDetected">
+        <div class="current-item-panel multi-item-warning" v-if="isRecognizing && hasMultiItemError">
+          <div>
+            <h3>无法计价</h3>
+            <p>{{ multiItemMessage }}</p>
+          </div>
+        </div>
+        <div class="current-item-panel" v-else-if="isRecognizing && currentDetected">
           <div class="item-info">
             <h3>识别结果: {{ currentDetected.name }} ({{ currentDetected.freshness }})</h3>
             <div class="specs">
@@ -210,9 +217,12 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 
 // === 原有状态 ===
+const route = useRoute();
+const router = useRouter();
 const isRecognizing = ref(false);
 const cartItems = ref([]);
 const currentImage = ref('');
@@ -224,24 +234,32 @@ let ws = null;
 // === LSTM 部分遮挡 ROI 标注状态 ===
 const roiDrawMode = ref(false);
 const roiBox = ref(null);
+const roiDraftBox = ref(null);
 const roiDraftStart = ref(null);
 const isDrawingRoi = ref(false);
+const videoGeometryVersion = ref(0);
 const handOverlayEnabled = ref(false);
 const showTerminalCheatAlert = ref(false);
 const terminalCheatAlert = ref({});
+const hasMultiItemError = ref(false);
+const multiItemMessage = ref('');
 
 const roiBoxStyle = computed(() => {
-  if (!roiBox.value) return {};
+  videoGeometryVersion.value;
+  const activeBox = roiDraftBox.value || roiBox.value;
+  const imageRect = getDisplayedImageRect();
+  if (!activeBox || !imageRect) return {};
+
   return {
-    left: `${roiBox.value.x * 100}%`,
-    top: `${roiBox.value.y * 100}%`,
-    width: `${roiBox.value.w * 100}%`,
-    height: `${roiBox.value.h * 100}%`
+    left: `${imageRect.offsetX + activeBox.x * imageRect.width}px`,
+    top: `${imageRect.offsetY + activeBox.y * imageRect.height}px`,
+    width: `${activeBox.w * imageRect.width}px`,
+    height: `${activeBox.h * imageRect.height}px`
   };
 });
 
 // === 新增：支付页状态控制 ===
-const showPaymentPage = ref(false); // 改成了页面切换控制
+const showPaymentPage = ref(route.meta.paymentPreview === true);
 const currentOrderId = ref('');
 const qrCodeUrl = ref('');
 const paymentStatus = ref('pending'); // pending, success
@@ -250,6 +268,13 @@ const timeLeft = ref(119);
 let pollingInterval = null;
 let countdownInterval = null;
 let paymentWs = null;
+
+watch(
+  () => route.path,
+  () => {
+    showPaymentPage.value = route.meta.paymentPreview === true;
+  }
+);
 
 // 计算总价
 const cartTotalPrice = computed(() => {
@@ -266,38 +291,60 @@ const toggleRecognition = async () => {
   isRecognizing.value = !isRecognizing.value;
 
   if (isRecognizing.value) {
-    ws = new WebSocket('ws://localhost:8000/video/ws');
-    ws.onopen = () => console.log('已连接到后端相机流');
+    showTerminalCheatAlert.value = false;
+    terminalCheatAlert.value = {};
+    const socket = new WebSocket('ws://localhost:8000/video/ws');
+    ws = socket;
+    socket.onopen = () => console.log('已连接到后端相机流');
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      // 旧连接关闭过程中可能仍有已排队消息，只处理当前活动 WebSocket。
+      if (ws !== socket) return;
+
       const data = JSON.parse(event.data);
       currentImage.value = data.image;
       handOverlayEnabled.value = Boolean(data.hand_overlay_enabled);
 
       let realWeight = Math.max(0, data.weight || 0);
-      parseCurrentItem(data.items, realWeight);
+      if (data.status === 'multi_item_error' || data.item_status === 'multi_item_error') {
+        hasMultiItemError.value = true;
+        multiItemMessage.value = data.message || '检测到多种果蔬，请一次仅放置一种商品称重';
+        currentDetected.value = null;
+      } else {
+        hasMultiItemError.value = false;
+        multiItemMessage.value = '';
+        parseCurrentItem(data.items, realWeight);
+      }
 
       if (data.status === 'alert') {
         terminalCheatAlert.value = data;
         showTerminalCheatAlert.value = true;
         isRecognizing.value = false;
         currentDetected.value = null;
-        if (ws) {
-          ws.close();
+        if (ws === socket) {
           ws = null;
         }
+        socket.close();
       }
     };
 
-    ws.onerror = (error) => console.error('WebSocket 发生错误:', error);
-    ws.onclose = () => {
+    socket.onerror = (error) => console.error('WebSocket 发生错误:', error);
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      ws = null;
       console.log('WebSocket 连接关闭');
       currentImage.value = '';
     };
   } else {
-    if (ws) { ws.close(); ws = null; }
+    if (ws) {
+      const socket = ws;
+      ws = null;
+      socket.close();
+    }
     currentImage.value = '';
     currentDetected.value = null;
+    hasMultiItemError.value = false;
+    multiItemMessage.value = '';
   }
 };
 
@@ -338,6 +385,11 @@ const parseCurrentItem = (items, currentWeight) => {
 };
 
 const addToCart = () => {
+  if (hasMultiItemError.value) {
+    alert('检测到多种果蔬，请一次仅放置一种商品称重');
+    return;
+  }
+
   if (currentDetected.value) {
     cartItems.value.push({
       name: currentDetected.value.name,
@@ -395,6 +447,7 @@ const handleCheckout = async () => {
     qrCodeUrl.value = resData.qr_code_url;
     paymentStatus.value = 'pending';
     showPaymentPage.value = true; // 隐藏收银台，显示支付页
+    await router.push('/payment');
 
     // 4. 开启倒计时、WebSocket 通知和轮询兜底
     startCountdown();
@@ -422,13 +475,46 @@ const startCountdown = () => {
   }, 1000);
 };
 
-const pointToNormalized = (event) => {
+const getDisplayedImageRect = () => {
   const box = videoBoxRef.value;
-  if (!box) return null;
+  const image = videoImageRef.value;
+  if (!box || !image) return null;
 
-  const rect = box.getBoundingClientRect();
-  const x = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-  const y = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
+  const boxRect = box.getBoundingClientRect();
+  const naturalWidth = image.naturalWidth || 640;
+  const naturalHeight = image.naturalHeight || 640;
+  const scale = Math.min(boxRect.width / naturalWidth, boxRect.height / naturalHeight);
+  const width = naturalWidth * scale;
+  const height = naturalHeight * scale;
+
+  return {
+    boxRect,
+    offsetX: (boxRect.width - width) / 2,
+    offsetY: (boxRect.height - height) / 2,
+    width,
+    height
+  };
+};
+
+const syncVideoGeometry = () => {
+  videoGeometryVersion.value++;
+};
+
+const pointToNormalized = (event, clampToImage = false) => {
+  const imageRect = getDisplayedImageRect();
+  if (!imageRect) return null;
+
+  const relativeX = event.clientX - imageRect.boxRect.left - imageRect.offsetX;
+  const relativeY = event.clientY - imageRect.boxRect.top - imageRect.offsetY;
+  if (!clampToImage && (
+    relativeX < 0 || relativeY < 0 ||
+    relativeX > imageRect.width || relativeY > imageRect.height
+  )) {
+    return null;
+  }
+
+  const x = Math.min(1, Math.max(0, relativeX / imageRect.width));
+  const y = Math.min(1, Math.max(0, relativeY / imageRect.height));
   return { x, y };
 };
 
@@ -439,25 +525,43 @@ const startRoiDraw = (event) => {
 
   isDrawingRoi.value = true;
   roiDraftStart.value = point;
-  roiBox.value = { x: point.x, y: point.y, w: 0, h: 0 };
+  roiDraftBox.value = { x: point.x, y: point.y, w: 0, h: 0 };
 };
 
 const updateRoiDraw = (event) => {
   if (!roiDrawMode.value || !isDrawingRoi.value || !roiDraftStart.value) return;
-  const point = pointToNormalized(event);
+  const point = pointToNormalized(event, true);
   if (!point) return;
 
   const x1 = Math.min(roiDraftStart.value.x, point.x);
   const y1 = Math.min(roiDraftStart.value.y, point.y);
   const x2 = Math.max(roiDraftStart.value.x, point.x);
   const y2 = Math.max(roiDraftStart.value.y, point.y);
-  roiBox.value = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+  roiDraftBox.value = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
 };
 
 const finishRoiDraw = () => {
   if (!isDrawingRoi.value) return;
+  if (roiDraftBox.value && roiDraftBox.value.w >= 0.02 && roiDraftBox.value.h >= 0.02) {
+    roiBox.value = roiDraftBox.value;
+  }
+
   isDrawingRoi.value = false;
   roiDraftStart.value = null;
+  roiDraftBox.value = null;
+};
+
+const loadRoi = async () => {
+  try {
+    const res = await fetch('http://localhost:8000/video/roi');
+    const data = await res.json();
+    if (data.status === 'success' && Array.isArray(data.roi) && data.roi.length === 4) {
+      const [x1, y1, x2, y2] = data.roi.map(Number);
+      roiBox.value = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+    }
+  } catch (error) {
+    console.warn('读取 ROI 失败，将在保存新区域后同步:', error);
+  }
 };
 
 const saveRoi = async () => {
@@ -568,9 +672,16 @@ const paymentSuccess = () => {
 
   // 延迟 2.5 秒后自动返回收银台并清空购物车
   setTimeout(() => {
-    showPaymentPage.value = false;
+    returnToTerminal();
     cartItems.value = [];
   }, 2500);
+};
+
+const returnToTerminal = () => {
+  showPaymentPage.value = false;
+  if (route.path === '/payment') {
+    router.push('/terminal');
+  }
 };
 
 const cancelPayment = () => {
@@ -580,16 +691,19 @@ const cancelPayment = () => {
     paymentWs.close();
     paymentWs = null;
   }
-  showPaymentPage.value = false; // 返回收银台
+  returnToTerminal();
 };
 
 // === 生命周期清理 ===
 onMounted(() => {
   window.addEventListener('keydown', handleKeyDown);
+  window.addEventListener('resize', syncVideoGeometry);
+  loadRoi();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeyDown);
+  window.removeEventListener('resize', syncVideoGeometry);
   if (ws) ws.close();
   if (paymentWs) paymentWs.close();
   if (pollingInterval) clearInterval(pollingInterval);
@@ -625,6 +739,9 @@ onBeforeUnmount(() => {
   padding: 15px; margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center;
 }
 .current-item-panel.empty { background-color: #f5f5f5; border: 2px dashed #ccc; justify-content: center; color: #666; }
+.current-item-panel.multi-item-warning { background: #fff1f0; border-color: #ff4d4f; color: #cf1322; }
+.current-item-panel.multi-item-warning h3 { margin: 0 0 8px; color: #cf1322; }
+.current-item-panel.multi-item-warning p { margin: 0; color: #cf1322; font-weight: 700; }
 .item-info h3 { margin: 0 0 10px 0; color: #333; }
 .specs { margin-bottom: 8px; }
 .spec-block { margin-right: 20px; font-size: 16px; color: #555; }

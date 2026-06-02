@@ -38,4 +38,15 @@ apiClient.interceptors.response.use(
   }
 );
 
+export const getAdminTransactions = (params) => apiClient.get('/admin/transactions', { params });
+
+export const updateTransactionManualCheck = (transactionId, payload) => (
+  apiClient.put(`/admin/transactions/${encodeURIComponent(transactionId)}/manual-check`, payload)
+);
+
+export const getTransactionVideoUrl = (transactionId, videoUrl = '') => {
+  const fallbackUrl = `/api/admin/transactions/${encodeURIComponent(transactionId)}/video`;
+  return new URL(videoUrl || fallbackUrl, new URL(apiClient.defaults.baseURL).origin).toString();
+};
+
 export default apiClient;

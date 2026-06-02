@@ -6,7 +6,10 @@ import joblib
 import requests
 import chinese_calendar as lunar
 from core.database import engine
+from core.inventory_schema import ensure_inventory_schema
+from core.pricing_optimizer import optimize_sales_volume_price
 import traceback
+from time import monotonic
 
 router = APIRouter(prefix="/api/dashboard", tags=["大屏看板与预测"])
 
@@ -32,27 +35,52 @@ BASE_PRICE_MAP = {
 
 TRAIN_CATEGORIES = ['土豆', '芒果', '苹果', '草莓', '葡萄', '西瓜', '西红柿', '香蕉', '黄瓜']
 FRUIT_CATEGORIES = TRAIN_CATEGORIES
+WEATHER_CACHE_TTL_SECONDS = 600.0
+_weather_cache = {"updated_at": 0.0, "data": None}
 
 
-# 🌟 2. 强植入经济学常识：价格弹性倍数器
-def get_elasticity_multiplier(ratio):
-    if ratio <= 0: return 0.0
-    if ratio < 1.0:
-        return min(4.0, 1.0 + (1.0 - ratio) * 3.5)
-    else:
-        return max(0.0, 1.0 - (ratio - 1.0) * 3.0)
+def predict_sales_with_xgboost(feature_dict):
+    """Run one XGBoost sales forecast with the supplied candidate price."""
+    if model is None:
+        return 0.0
+
+    df_features = pd.DataFrame([feature_dict])[FEATURE_COLUMNS]
+    df_features['item_name'] = pd.Categorical(
+        df_features['item_name'],
+        categories=TRAIN_CATEGORIES,
+    )
+    return max(0.0, float(model.predict(df_features)[0]))
+
+
+def predict_sales_batch_with_xgboost(feature_dicts):
+    """Run candidate-price forecasts in one model call to keep the API responsive."""
+    if model is None or not feature_dicts:
+        return []
+
+    df_features = pd.DataFrame(feature_dicts)[FEATURE_COLUMNS]
+    df_features['item_name'] = pd.Categorical(
+        df_features['item_name'],
+        categories=TRAIN_CATEGORIES,
+    )
+    return [max(0.0, float(value)) for value in model.predict(df_features)]
 
 
 def fetch_real_weather_24h():
+    now = monotonic()
+    if _weather_cache["data"] is not None and now - _weather_cache["updated_at"] < WEATHER_CACHE_TTL_SECONDS:
+        return _weather_cache["data"]
+
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {"latitude": 39.9042, "longitude": 116.4074, "hourly": ["temperature_2m", "precipitation_probability"],
                   "timezone": "Asia/Shanghai", "forecast_days": 2}
-        response = requests.get(url, params=params, timeout=5).json()
+        response = requests.get(url, params=params, timeout=1.2).json()
         weather_dict = {}
         for t, temp, precip in zip(response['hourly']['time'], response['hourly']['temperature_2m'],
                                    response['hourly']['precipitation_probability']):
             weather_dict[t.replace('T', ' ')] = {'temp': temp, 'rainy': 1 if precip > 30 else 0}
+        _weather_cache["updated_at"] = now
+        _weather_cache["data"] = weather_dict
         return weather_dict
     except:
         return None
@@ -89,6 +117,7 @@ def get_sales_and_pricing():
              'is_weekend': is_weekend, 'is_holiday': is_holiday})
 
     try:
+        ensure_inventory_schema()
         df_inventory = pd.read_sql('SELECT * FROM fruit_inventory', con=engine)
         df_history = pd.read_sql('SELECT * FROM fruit_sales_history', con=engine)
         df_history['datetime'] = pd.to_datetime(df_history['datetime'])
@@ -101,14 +130,16 @@ def get_sales_and_pricing():
 
         current_inventory = float(inv_row.iloc[0]['inventory'])
         current_price = float(inv_row.iloc[0]['price'])
+        cost_price = float(inv_row.iloc[0]['cost_price'])
         current_freshness = float(inv_row.iloc[0]['freshness'])
 
         item_history = df_history[df_history['item_name'] == item].set_index('datetime')
         last_1h_sales = float(item_history.iloc[-1]['actual_sales']) if not item_history.empty else 0.0
 
         base_p = BASE_PRICE_MAP.get(item, 10.0)
-        cost_p = base_p * 0.4
-        best_price, best_profit, best_sales_pred = current_price, -float('inf'), 0
+        best_price, best_sales_pred = current_price, 0.0
+        floor_price = cost_price
+        inventory_policy = "模型不可用，暂时保持当前售价"
 
         if model is not None and item in TRAIN_CATEGORIES:
             try:
@@ -120,52 +151,61 @@ def get_sales_and_pricing():
                 sales_last_week_0 = float(item_history.loc[
                                               last_week_time_0, 'actual_sales']) if last_week_time_0 in item_history.index else last_1h_sales
 
-                feat_dict = {
+                feature_context = {
                     "item_name": item, "hour": weather_0['hour'], "day_of_week": weather_0['day_of_week'],
                     "is_weekend": weather_0['is_weekend'], "is_holiday": weather_0['is_holiday'],
-                    "freshness": current_freshness, "inventory": current_inventory, "price": base_p,
+                    "freshness": current_freshness, "inventory": current_inventory, "price": current_price,
                     "temperature": weather_0['temperature'], "is_rainy": weather_0['is_rainy'],
                     "sales_last_1h": last_1h_sales, "sales_yesterday_same_hour": sales_yesterday_0,
                     "sales_last_week_same_hour": sales_last_week_0
                 }
-                df_test = pd.DataFrame([feat_dict])[FEATURE_COLUMNS]
-                df_test['item_name'] = pd.Categorical(df_test['item_name'], categories=TRAIN_CATEGORIES)
-                pred_base = max(0.0, float(model.predict(df_test)[0]))
 
-                candidate_multipliers = np.arange(0.6, 1.35, 0.05)
-                candidate_prices = [round(base_p * m, 2) for m in candidate_multipliers]
-                if current_price not in candidate_prices: candidate_prices.append(current_price)
+                def predict_candidate_sales(candidate_price):
+                    return predict_sales_with_xgboost(
+                        {**feature_context, "price": candidate_price}
+                    )
 
-                for test_p in candidate_prices:
-                    ratio = test_p / base_p
-                    sim_sales = min(pred_base * get_elasticity_multiplier(ratio), current_inventory)
-                    profit = sim_sales * (test_p - cost_p)
-                    if current_freshness < 0.6: profit += sim_sales * cost_p * 0.8
-                    if test_p == current_price: profit += 0.1
-                    if profit > best_profit: best_profit, best_price, best_sales_pred = profit, test_p, sim_sales
+                def predict_candidate_sales_batch(candidate_prices):
+                    return predict_sales_batch_with_xgboost([
+                        {**feature_context, "price": candidate_price}
+                        for candidate_price in candidate_prices
+                    ])
+
+                recommendation = optimize_sales_volume_price(
+                    current_price=current_price,
+                    cost_price=cost_price,
+                    inventory=current_inventory,
+                    freshness=current_freshness,
+                    market_anchor_price=base_p,
+                    predict_sales=predict_candidate_sales,
+                    predict_sales_batch=predict_candidate_sales_batch,
+                )
+                best_price = recommendation.suggested_price
+                best_sales_pred = recommendation.predicted_sales
+                floor_price = recommendation.floor_price
+                inventory_policy = recommendation.policy
             except Exception as e:
                 print(f"Optimization error for '{item}': {e}")
 
-        if current_price > base_p * 1.5:
-            status, reason = "down", f"标价偏离市场导致销量枯竭。建议降至 ¥{best_price} 止损。"
-        elif current_price < cost_p:
-            status, reason = "up", f"已跌破进货成本，产生严重负毛利。必须上调至 ¥{best_price} 恢复盈利。"
+        if current_price < floor_price:
+            status, reason = "up", f"当前售价低于库存策略止损底价 ¥{floor_price:.2f}，建议立即上调。"
         elif best_price > current_price + 0.1:
-            status, reason = "up", f"需求旺盛，适度提价至 ¥{best_price} 可实现利润最大化 (预估可售 {round(best_sales_pred, 1)}kg)。"
+            status, reason = "up", f"建议售价 ¥{best_price:.2f} 仍可达到最大预测销量 {best_sales_pred:.1f}kg，同时减少不必要让利。"
         elif best_price < current_price - 0.1:
-            status, reason = "down", f"下调至 ¥{best_price} 可利用弹性激活走量 (预估 {round(best_sales_pred, 1)}kg)。"
+            status, reason = "down", f"下调至 ¥{best_price:.2f} 可达到最大预测销量 {best_sales_pred:.1f}kg，且不低于止损底价 ¥{floor_price:.2f}。"
         else:
-            status, reason = "normal", f"当前标价 ¥{current_price} 已处于最优区间，预估售出 {round(best_sales_pred, 1)}kg。"
+            status, reason = "normal", f"当前售价已能达到最大预测销量 {best_sales_pred:.1f}kg，无需调价。"
+        reason = f"{reason} {inventory_policy}。"
 
         pricing_strategy.append(
             {"name": item, "base_price": round(current_price, 2), "suggested_price": round(best_price, 2),
-             "reason": reason, "status": status})
+             "cost_price": round(cost_price, 2), "floor_price": round(floor_price, 2),
+             "predicted_sales": round(best_sales_pred, 2), "reason": reason, "status": status})
 
         hourly_sales_pred = []
         if model is not None and item in TRAIN_CATEGORIES:
             try:
                 temp_inventory, temp_freshness, temp_last_1h = current_inventory, current_freshness, last_1h_sales
-                current_elasticity = get_elasticity_multiplier(current_price / base_p)
                 for i in range(24):
                     weather, target_time = future_conditions[i], future_hours[i]
                     yesterday_time, last_week_time = target_time - pd.Timedelta(days=1), target_time - pd.Timedelta(
@@ -179,16 +219,12 @@ def get_sales_and_pricing():
                     feature_dict = {
                         "item_name": item, "hour": weather['hour'], "day_of_week": weather['day_of_week'],
                         "is_weekend": weather['is_weekend'], "is_holiday": weather['is_holiday'],
-                        "freshness": temp_freshness, "inventory": temp_inventory, "price": base_p,
+                        "freshness": temp_freshness, "inventory": temp_inventory, "price": current_price,
                         "temperature": weather['temperature'], "is_rainy": weather['is_rainy'],
                         "sales_last_1h": temp_last_1h, "sales_yesterday_same_hour": sales_yesterday,
                         "sales_last_week_same_hour": sales_last_week
                     }
-                    df_features = pd.DataFrame([feature_dict])[FEATURE_COLUMNS]
-                    df_features['item_name'] = pd.Categorical(df_features['item_name'], categories=TRAIN_CATEGORIES)
-
-                    pred_val_base = max(0.0, float(model.predict(df_features)[0]))
-                    pred_val = pred_val_base * current_elasticity
+                    pred_val = predict_sales_with_xgboost(feature_dict)
                     pred_val = min(pred_val, temp_inventory)
 
                     hourly_sales_pred.append(round(pred_val, 2))
@@ -223,11 +259,20 @@ def get_advanced_monitor():
 
         # 2. 真实查库：商品库存与新鲜度，用于智能建议
         try:
-            df_inv = pd.read_sql('SELECT item_name, price, inventory, freshness FROM fruit_inventory', con=engine)
+            ensure_inventory_schema()
+            df_inv = pd.read_sql(
+                'SELECT item_name, price, cost_price, inventory, freshness FROM fruit_inventory',
+                con=engine,
+            )
         except:
             df_inv = pd.DataFrame()
 
         alerts, pricing = [], []
+        sales_pricing_payload = get_sales_and_pricing()
+        strategy_by_name = {
+            item['name']: item
+            for item in sales_pricing_payload.get('pricing_strategy', [])
+        }
         if not df_inv.empty:
             for _, row in df_inv.iterrows():
                 name, price = row['item_name'], float(row['price'])
@@ -240,14 +285,19 @@ def get_advanced_monitor():
                     alerts.append({"name": name, "status": "积压警告", "color": "yellow", "current": inv, "max": 50,
                                    "percent": (inv / 50) * 100})
 
-                if fresh < 0.5 and inv > 20:
-                    pricing.append({"name": name, "tag": "滞销出清", "tag_color": "red", "old_price": price,
-                                    "new_price": round(price * 0.8, 2), "discount": "-20%",
-                                    "reason": "新鲜度衰减明显，且库存积压较多。建议立刻打折加速出清避免损耗。"})
-                elif inv < 10 and fresh > 0.8:
-                    pricing.append({"name": name, "tag": "供不应求", "tag_color": "green", "old_price": price,
-                                    "new_price": round(price * 1.1, 2), "discount": "+10%",
-                                    "reason": "处于消费高峰且极度新鲜，库存紧缺。建议适度溢价平缓消耗，争取补货时间。"})
+                strategy = strategy_by_name.get(name)
+                if strategy and abs(float(strategy['suggested_price']) - price) > 0.01:
+                    new_price = float(strategy['suggested_price'])
+                    change_percent = ((new_price - price) / price * 100.0) if price else 0.0
+                    pricing.append({
+                        "name": name,
+                        "tag": "XGBoost 走量优化",
+                        "tag_color": "green" if change_percent >= 0 else "red",
+                        "old_price": price,
+                        "new_price": new_price,
+                        "discount": f"{change_percent:+.1f}%",
+                        "reason": strategy['reason'],
+                    })
         else:
             alerts = [{"name": "苹果", "status": "畅销", "color": "blue", "current": 12, "max": 50, "percent": 24}]
             pricing = []

@@ -27,10 +27,13 @@ for path in (BASE_DIR, PROJECT_ROOT):
         sys.path.append(path)
 
 from core.camera_driver import AstraCamera
-from core.detector_4d import FruitDetector4D
+from core.detector_4d import FruitDetector4D, analyze_detected_items
 from core.alarm_log import AlarmLog
 from core.database import SessionLocal
+from core.order_video import cache_order_video_frame
+from core.realtime_anti_cheat import RealtimeOcclusionGuard, RealtimeWeightGuard
 from core.scale_driver import RealTimeScale
+from core.system_config import get_runtime_config
 from model_training.LSTM.preprocess import DataAligner
 from model_training.LSTM.vision_processor import HandVisionProcessor
 
@@ -75,12 +78,14 @@ FRAME_BUFFER_MAXLEN = FRAME_CACHE_SECONDS * FRAME_CACHE_FPS_ESTIMATE
 ALARM_COOLDOWN_SECONDS = 10.0
 
 # 论文中的遮挡特征定义为 ROI 内手部关键点数 / 21。
-# 只有比例持续高于 0.8 超过 5 秒，才允许把 occlusion 判定升级为真正告警。
+# 遮挡比例仍按论文使用 0.8；持续时间由 system_config 动态配置。
 OCCLUSION_RATIO_THRESHOLD = 0.8
-OCCLUSION_HOLD_SECONDS = 5.0
-
-# 与论文保持一致：置信度低于 0.85 的 LSTM 结果仅作为调试信息，不触发拦截。
-LSTM_ALERT_SCORE_THRESHOLD = 0.85
+# 高遮挡持续一小段时间后，先进入候选态。候选态会压住 LSTM 对遮挡动作的
+# swap/lift 误分类；持续时间达到管理员配置阈值后再升级为 occlusion 告警。
+OCCLUSION_CANDIDATE_SECONDS = 0.8
+# 重量保护层检测到短促动作后锁存一小段时间，避免随后返回的异步 LSTM
+# 普通结果立即覆盖告警，导致前端只能看到一帧。
+WEIGHT_GUARD_ALERT_SECONDS = 2.0
 
 # HTTP 请求必须放到线程池中执行，避免 requests.post 阻塞事件循环，
 # 从而保证 WebSocket 视频流和重量数据持续推送。
@@ -102,9 +107,8 @@ scale = RealTimeScale(port="COM5", baud=115200)
 
 # LSTM 多模态防作弊模块：
 # vision 负责从视频帧提取手部/遮挡特征；
-# aligner 负责把视觉特征和重量特征对齐成长度为 60 的时序窗口。
+# WebSocket 会话会各自创建 DataAligner，避免上一次作弊窗口污染下一次识别。
 vision = HandVisionProcessor(roi_box=[0.2, 0.4, 0.8, 1.0])
-aligner = DataAligner(window_size=ALIGN_WINDOW_SIZE)
 hand_overlay_enabled = False
 
 
@@ -381,6 +385,14 @@ async def video_feed(websocket: WebSocket):
     """
     await websocket.accept()
 
+    # 每次重新点击“开始识别”都会建立新的 WebSocket。
+    # 对齐窗口必须属于当前连接，不能复用上一次作弊发生时残留的 60 帧。
+    session_aligner = DataAligner(window_size=ALIGN_WINDOW_SIZE)
+    weight_guard = RealtimeWeightGuard()
+    occlusion_guard = RealtimeOcclusionGuard(
+        ratio_threshold=OCCLUSION_RATIO_THRESHOLD,
+        candidate_hold_seconds=OCCLUSION_CANDIDATE_SECONDS,
+    )
     frame_count = 0
     verify_future: Optional[asyncio.Future] = None
     alarm_future: Optional[asyncio.Future] = None
@@ -392,14 +404,20 @@ async def video_feed(websocket: WebSocket):
     current_prediction = "normal"
     current_is_secure = True
     current_lstm_score = 0.0
+    current_detection_source = "normal"
+    current_detection_reason = ""
+    active_weight_violation = None
+    weight_guard_alert_until = 0.0
     last_alarm_at = 0.0
-    occlusion_started_at: Optional[float] = None
     occlusion_hold_seconds = 0.0
 
     try:
         loop = asyncio.get_running_loop()
 
         while True:
+            # 配置服务优先返回内存快照，后台保存后立即更新，无需重启服务。
+            runtime_config = get_runtime_config()
+
             # 1. 采集 Astra 相机的彩色帧和深度帧。
             color, depth = camera.get_frames()
 
@@ -409,19 +427,37 @@ async def video_feed(websocket: WebSocket):
             # 二者都在当前帧周期内完成，并立即送入 aligner 形成同步滑窗。
             vision_features = vision.extract_features(color)
             raw_weight, weight_diff = scale.get_features()
-            aligner.update(vision_features, [raw_weight, weight_diff])
+            session_aligner.update(vision_features, [raw_weight, weight_diff])
 
             # 论文中的部分遮挡特征为 ROI 内关键点数量 / 21。
             # 仅当该比例持续超过阈值 5 秒，才允许 occlusion 告警通过。
             occlusion_ratio = float(vision_features[3])
             now = monotonic()
-            if occlusion_ratio >= OCCLUSION_RATIO_THRESHOLD:
-                if occlusion_started_at is None:
-                    occlusion_started_at = now
-                occlusion_hold_seconds = now - occlusion_started_at
-            else:
-                occlusion_started_at = None
-                occlusion_hold_seconds = 0.0
+            occlusion_violation = occlusion_guard.update(
+                now=now,
+                occlusion_ratio=occlusion_ratio,
+                weight=raw_weight,
+                weight_diff=weight_diff,
+                alert_hold_seconds=runtime_config.occlusion_duration_threshold,
+            )
+            occlusion_hold_seconds = occlusion_guard.hold_seconds
+
+            # 串口读取频率和视频帧率不同。逐条消费帧间重量跳变，避免快速拿走再放回
+            # 在净变化量中相互抵消。没有新跳变时仍推进一次，以便托举持续计时。
+            weight_events = scale.consume_weight_events()
+            if not weight_events:
+                weight_events = [(now, raw_weight, 0.0)]
+
+            guard_violation = None
+            for event_at, event_weight, event_diff in weight_events:
+                violation = weight_guard.update(
+                    now=event_at,
+                    weight=event_weight,
+                    weight_diff=event_diff,
+                    vision_features=vision_features,
+                )
+                if violation is not None:
+                    guard_violation = violation
 
             # 3. 如果上一次后台防作弊校验已经完成，在这里无阻塞地取回结果。
             # done() 为 False 时绝不 await，视频流继续往下跑。
@@ -442,17 +478,58 @@ async def video_feed(websocket: WebSocket):
                     current_prediction = result.get("prediction", "unknown")
                     current_is_secure = bool(result.get("is_secure", True))
                     current_lstm_score = float(result.get("lstm_score", 0.0))
+                    current_detection_source = "lstm"
+                    current_detection_reason = ""
 
-                    # 论文阈值为 0.85。低置信度输出不拦截，避免实时测试时产生噪声告警。
-                    if current_lstm_score < LSTM_ALERT_SCORE_THRESHOLD:
+                    # 低置信度输出不拦截，阈值可由管理员后台实时微调。
+                    if current_lstm_score < runtime_config.anti_cheat_threshold:
                         current_is_secure = True
 
-                    # 部分遮挡还要满足 ROI 占比连续保持超过 5 秒。
+                    # 部分遮挡还要满足 ROI 占比连续保持超过管理员配置的持续时间。
                     if (
                         current_prediction == "occlusion"
-                        and occlusion_hold_seconds < OCCLUSION_HOLD_SECONDS
+                        and not occlusion_guard.is_alert_ready(
+                            runtime_config.occlusion_duration_threshold
+                        )
                     ):
                         current_is_secure = True
+
+            # LSTM 是主判定器；重量轨迹保护层补强现场演示中非常短促的替换动作，
+            # 以及低重量商品的持续托举动作。保护层同样服从管理员配置的告警阈值。
+            if guard_violation is not None:
+                active_weight_violation = guard_violation
+                weight_guard_alert_until = now + WEIGHT_GUARD_ALERT_SECONDS
+
+            if now >= weight_guard_alert_until:
+                active_weight_violation = None
+
+            if (
+                active_weight_violation is not None
+                and active_weight_violation.score >= runtime_config.anti_cheat_threshold
+            ):
+                current_prediction = active_weight_violation.prediction
+                current_is_secure = False
+                current_lstm_score = active_weight_violation.score
+                current_detection_source = "weight_guard"
+                current_detection_reason = active_weight_violation.reason
+
+            # 遮挡特征是连续高 ROI 占比。先抑制候选期内的 swap/lift 误分类，
+            # 达到配置时长后再以最高优先级明确输出 occlusion。
+            if occlusion_violation is not None:
+                current_prediction = occlusion_violation.prediction
+                current_is_secure = False
+                current_lstm_score = max(current_lstm_score, occlusion_violation.score)
+                current_detection_source = "occlusion_guard"
+                current_detection_reason = occlusion_violation.reason
+            elif (
+                occlusion_guard.is_candidate
+                and current_prediction in {"swap", "lift"}
+            ):
+                current_prediction = "occlusion_pending"
+                current_is_secure = True
+                current_lstm_score = 0.0
+                current_detection_source = "occlusion_guard"
+                current_detection_reason = "ROI 内持续高遮挡，等待达到遮挡告警时长"
 
             # 取回后台证据保存任务结果，避免 Future 异常被静默吞掉。
             # 这里只做轻量状态清理，不阻塞当前 WebSocket 循环。
@@ -468,7 +545,7 @@ async def video_feed(websocket: WebSocket):
 
             # 4. 满 60 帧对齐窗口后，每隔 10 帧触发一次后台校验。
             # 如果上一个请求还没完成，本轮跳过，避免 HTTP 请求堆积导致延迟越来越大。
-            sequence = aligner.get_sequence()
+            sequence = session_aligner.get_sequence()
             if (
                 sequence is not None
                 and frame_count % VERIFY_INTERVAL_FRAMES == 0
@@ -485,9 +562,21 @@ async def video_feed(websocket: WebSocket):
 
             # 6. 原有 4D YOLO 果蔬检测。
             detections, raw_img = detector.detect(color, depth)
+            item_analysis = analyze_detected_items(
+                detections,
+                confidence_threshold=runtime_config.min_confidence_threshold,
+            )
+
+            # 多种果蔬混放时停止计价：前端只收到空 items，不会继续按最高置信度商品计价。
+            # 多个同类框则继续使用有效框，由前端按最高置信度框确定商品名称，
+            # 重量仍来自电子秤总重量，相当于按同一种商品合并称重。
+            pricing_items = item_analysis["effective_detections"]
+            if item_analysis["status"] == "multi_item_error":
+                pricing_items = []
 
             # 7. 缓存 raw_img 原始帧。必须 copy，避免后续绘制框或数组复用影响证据视频。
             frame_buffer.append(raw_img.copy())
+            cache_order_video_frame(raw_img)
 
             # 8. 如果 LSTM 判定当前窗口存在作弊，触发一次后台证据留存。
             # 注意：只提交线程池任务，主循环继续推送视频，绝不等待视频写盘或数据库写入。
@@ -529,16 +618,30 @@ async def video_feed(websocket: WebSocket):
 
             message = {
                 "image": jpg_text,
-                "items": detections,
+                "items": pricing_items,
                 "weight": weight_kg,
                 "status": security_signal["status"],
+                "item_status": item_analysis["status"],
+                "error_code": item_analysis["error_code"],
+                "message": item_analysis["message"],
+                "pricing_mode": item_analysis["pricing_mode"],
+                "valid_detection_count": item_analysis["valid_detection_count"],
+                "detected_categories": item_analysis["detected_categories"],
                 "lstm_score": round(current_lstm_score, 3),
                 "occlusion_ratio": round(occlusion_ratio, 3),
                 "occlusion_hold_seconds": round(occlusion_hold_seconds, 2),
                 "hand_overlay_enabled": hand_overlay_enabled,
+                "anti_cheat_threshold": runtime_config.anti_cheat_threshold,
+                "occlusion_duration_threshold": runtime_config.occlusion_duration_threshold,
+                "min_confidence_threshold": runtime_config.min_confidence_threshold,
+                "detection_source": current_detection_source,
+                "detection_reason": current_detection_reason,
             }
             if security_signal["status"] == "alert":
                 message["type"] = security_signal["type"]
+            elif item_analysis["status"] == "multi_item_error":
+                # 防作弊告警优先级更高；无防作弊告警时，顶层 status 明确返回多商品错误。
+                message["status"] = "multi_item_error"
 
             await websocket.send_json(message)
 
@@ -546,3 +649,8 @@ async def video_feed(websocket: WebSocket):
 
     except Exception as exc:
         print(f"WebSocket disconnected or stopped: {exc}")
+    finally:
+        # 显式释放当前连接的历史帧，重新开始识别时必须重新采样完整窗口。
+        session_aligner.reset()
+        weight_guard.reset()
+        occlusion_guard.reset()

@@ -2,6 +2,8 @@ from fastapi import APIRouter, HTTPException, Depends, Header, Request, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
+import asyncio
+import logging
 import mimetypes
 import time
 import cv2
@@ -15,15 +17,18 @@ from urllib.parse import quote
 import jwt
 
 # === 数据库相关引入 ===
-from sqlalchemy import Column, String, Integer, Numeric, DateTime
+from sqlalchemy import Column, String, Integer, Numeric, DateTime, text
 from sqlalchemy.orm import Session
 # 假设你有一个 core/database.py 文件，里面配置了 SQLAlchemy 的 Base 和 get_db
 # 如果路径或命名不同，请根据你的实际项目结构调整
 from core.database import Base, get_db
+from core.order_video import save_payment_before_video
 from core.payment_state import create_payment_order, get_payment_order
+from core.sales_history import sync_sales_history_buckets
 from routers.user import ALGORITHM, SECRET_KEY
 
 router = APIRouter(prefix="/api/transaction", tags=["交易与防作弊模块"])
+logger = logging.getLogger(__name__)
 
 
 # ==========================================
@@ -39,6 +44,12 @@ class TransactionDB(Base):
     pay_amount = Column(Numeric(8, 2), nullable=False, comment="顾客实际支付扣款额")
     profit = Column(Numeric(8, 2), nullable=False, comment="本单利润")
     tag = Column(Integer, nullable=False, default=0, comment="违规标签")
+    anti_cheat_tag = Column(String(20), nullable=False, default="normal", comment="防作弊行为标签")
+    payment_before_video_path = Column(String(255), nullable=True, comment="支付前 8 秒视频路径")
+    manual_check_status = Column(String(20), nullable=False, default="unchecked", comment="人工巡查状态")
+    manual_check_note = Column(String(500), nullable=True, comment="管理员备注")
+    manual_check_time = Column(DateTime, nullable=True, comment="人工巡查时间")
+    manual_check_admin_id = Column(Integer, nullable=True, comment="操作管理员 ID")
     creat_at = Column(DateTime, nullable=False, default=datetime.now, comment="订单产生时间")
 
 
@@ -146,6 +157,47 @@ class OrderCreateReq(BaseModel):
     items: List[Dict[str, Any]]
     total_amount: float
     payment_channel: str = "mock_wechat"
+    session_id: Optional[str] = None
+
+
+TERMINAL_PRICE_MAP = {
+    "苹果": 4.5,
+    "番茄": 3.2,
+    "芒果": 8.5,
+    "橙子": 5.0,
+}
+
+
+def _get_backend_unit_price(db: Session, item: Dict[str, Any]) -> float:
+    """Resolve the server-owned unit price used during checkout."""
+    product_name = str(item.get("name", "")).strip()
+    unit_price = TERMINAL_PRICE_MAP.get(product_name)
+    if unit_price is None:
+        unit_price = db.execute(
+            text("SELECT price FROM fruit_inventory WHERE item_name = :item_name LIMIT 1"),
+            {"item_name": product_name},
+        ).scalar()
+    if unit_price is None:
+        raise ValueError(f"未配置商品价格: {product_name or '未知商品'}")
+
+    freshness = str(item.get("freshness", "")).strip()
+    if freshness == "腐烂":
+        return 0.0
+    if freshness == "瑕疵":
+        return round(float(unit_price) * 0.5, 2)
+    return round(float(unit_price), 2)
+
+
+def _calculate_backend_item_pay_amount(db: Session, item: Dict[str, Any]) -> tuple[float, float]:
+    """
+    Recalculate subtotal on the server instead of trusting the frontend subtotal.
+
+    Terminal-recognized goods use a backend-owned price map compatible with the
+    current frontend. Other configured goods fall back to fruit_inventory.price.
+    """
+    item_weight = max(0.0, float(item.get("weight", 0)))
+    item_unit_price = _get_backend_unit_price(db, item)
+    return item_weight, round(item_weight * item_unit_price, 2)
 
 
 @router.post("/create")
@@ -163,18 +215,28 @@ async def create_transaction(
 
     current_time = datetime.now()
     customer_id = customer["customer_id"]
-    transaction_ids = []
+    transaction_ids = [uuid.uuid4().hex for _ in req.items]
+    affected_sales_buckets = []
+    try:
+        video_result = await asyncio.to_thread(
+            save_payment_before_video,
+            transaction_ids[0] if transaction_ids else parent_order_id,
+            req.session_id or parent_order_id,
+        )
+    except Exception as exc:
+        video_result = {"ok": False, "path": None, "error": str(exc)}
+    payment_before_video_path = video_result.get("path") if video_result.get("ok") else None
+    if not video_result.get("ok"):
+        logger.warning("Payment-before video save failed, continuing checkout: %s", video_result)
+    backend_total_amount = 0.0
 
     try:
         # 2. 遍历购物车，每一项生成一条 transaction 记录
-        for item in req.items:
-            # 使用 uuid hex 生成 32 位的流水单号
-            tx_id = uuid.uuid4().hex
-            transaction_ids.append(tx_id)
+        for tx_id, item in zip(transaction_ids, req.items):
 
-            # 从前端获取重量和价格数据 (需确保转换为浮点数)
-            item_weight = float(item.get("weight", 0))
-            item_pay_amount = float(item.get("price", 0))
+            # 后端重新计算小计，忽略前端可篡改的 price 和 total_amount。
+            item_weight, item_pay_amount = _calculate_backend_item_pay_amount(db, item)
+            backend_total_amount += item_pay_amount
 
             # 利润计算模拟：假设利润是售价的 30% (实际可以根据你的进货价逻辑修改)
             item_profit = round(item_pay_amount * 0.3, 2)
@@ -190,11 +252,16 @@ async def create_transaction(
                 pay_amount=item_pay_amount,  # 顾客实际支付扣款额
                 profit=item_profit,  # 本单利润
                 tag=item_tag,
+                anti_cheat_tag="normal",
+                payment_before_video_path=payment_before_video_path,
+                manual_check_status="unchecked",
                 creat_at=current_time
             )
             db.add(new_tx)
+            affected_sales_buckets.append((new_tx.product_name, current_time))
 
-        # 3. 提交事务，真正写入 MySQL
+        db.flush()
+        sync_sales_history_buckets(db, affected_sales_buckets)
         db.commit()
     except Exception as e:
         db.rollback()
@@ -212,7 +279,7 @@ async def create_transaction(
     create_payment_order(
         order_id=parent_order_id,
         customer_id=customer_id,
-        amount=req.total_amount,
+        amount=round(backend_total_amount, 2),
         payment_url=payment_url,
         qr_code_url=qr_url,
         transaction_ids=transaction_ids,
@@ -221,12 +288,13 @@ async def create_transaction(
 
     return {
         "order_id": parent_order_id,
-        "total_amount": req.total_amount,
+        "total_amount": round(backend_total_amount, 2),
         "customer_id": customer_id,
         "openid": customer.get("openid"),
         "payment_status": "pending",
         "payment_url": payment_url,
         "qr_code_url": qr_url,
+        "payment_before_video_url": f"/{payment_before_video_path}" if payment_before_video_path else None,
         "msg": "订单流水已成功录入数据库"
     }
 
@@ -276,6 +344,9 @@ async def get_transaction_list(tag: int = None, db: Session = Depends(get_db)):
                 "pay_amount": float(r.pay_amount),  # 支付金额
                 "profit": float(r.profit),  # 利润
                 "tag": r.tag,  # 违规标签
+                "anti_cheat_tag": r.anti_cheat_tag,
+                "manual_check_status": r.manual_check_status,
+                "payment_before_video_url": f"/{r.payment_before_video_path}" if r.payment_before_video_path else None,
                 "creat_at": r.creat_at.strftime("%Y-%m-%d %H:%M:%S") if r.creat_at else ""
             })
         return {"status": "success", "data": result}
@@ -297,7 +368,16 @@ async def update_transaction_tag(transaction_id: str, req: TagUpdateReq, db: Ses
         if not tx:
             return {"status": "error", "message": "未找到该交易记录"}
 
+        affected_sales_bucket = (tx.product_name, tx.creat_at)
         tx.tag = req.tag
+        tx.anti_cheat_tag = {
+            0: "normal",
+            1: "swap",
+            2: "occlusion",
+            3: "lift",
+        }.get(req.tag, "abnormal")
+        db.flush()
+        sync_sales_history_buckets(db, [affected_sales_bucket])
         db.commit()
         return {"status": "success", "message": "状态更新成功"}
     except Exception as e:
@@ -315,7 +395,10 @@ async def delete_transaction(transaction_id: str, db: Session = Depends(get_db))
         if not tx:
             return {"status": "error", "message": "未找到该交易记录"}
 
+        affected_sales_bucket = (tx.product_name, tx.creat_at)
         db.delete(tx)
+        db.flush()
+        sync_sales_history_buckets(db, [affected_sales_bucket])
         db.commit()
         return {"status": "success", "message": "记录删除成功"}
     except Exception as e:
@@ -326,7 +409,6 @@ async def delete_transaction(transaction_id: str, db: Session = Depends(get_db))
 # ==========================================
 # 🌟 追加：LSTM 防作弊报警日志接口
 # ==========================================
-from sqlalchemy import text
 from core.database import engine
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from pathlib import Path
 from typing import Dict, List
 
@@ -127,6 +128,9 @@ def train_model(args) -> None:
 
     history_loss = []
     history_acc = []
+    best_val_acc = -1.0
+    best_epoch = 0
+    best_state = None
 
     print(f"训练样本: {len(train_dataset)}，验证样本: {len(val_dataset)}，设备: {device}")
     print(f"类别映射: {LABEL_MAP}")
@@ -148,6 +152,10 @@ def train_model(args) -> None:
         val_acc, class_acc = evaluate(model, val_loader, device)
         history_loss.append(avg_train_loss)
         history_acc.append(val_acc)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_epoch = epoch + 1
+            best_state = copy.deepcopy(model.state_dict())
 
         class_acc_text = " ".join(f"{k}:{v:.1f}%" for k, v in class_acc.items())
         print(
@@ -155,8 +163,8 @@ def train_model(args) -> None:
             f"Loss={avg_train_loss:.4f} ValAcc={val_acc:.2f}% {class_acc_text}"
         )
 
-    torch.save(model.state_dict(), output_path)
-    print(f"模型已保存: {output_path}")
+    torch.save(best_state or model.state_dict(), output_path)
+    print(f"最佳模型已保存: {output_path}，Epoch={best_epoch}，ValAcc={best_val_acc:.2f}%")
 
     plt.figure(figsize=(8, 5))
     plt.plot(range(1, args.epochs + 1), history_loss, marker="o", label="Training Loss")

@@ -6,8 +6,16 @@ const routes = [
     // 智能终端主页（需要登录）
     path: '/',
     name: 'Terminal',
+    alias: '/terminal',
     component: () => import('../views/TerminalView.vue'),
     meta: { requiresAuth: true }
+  },
+  {
+    // 支付页复用终端组件中的支付视图，避免重复维护两套支付界面
+    path: '/payment',
+    name: 'Payment',
+    component: () => import('../views/TerminalView.vue'),
+    meta: { requiresAuth: true, paymentPreview: true }
   },
   {
     // 商家运营后台（需要登录）
@@ -21,6 +29,11 @@ const routes = [
     path: '/login',
     name: 'Login',
     component: () => import('../views/Login.vue')
+  },
+  {
+    // 未知地址统一回到终端主页，避免出现空白页面
+    path: '/:pathMatch(.*)*',
+    redirect: '/'
   }
 ]
 

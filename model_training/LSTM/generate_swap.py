@@ -20,6 +20,8 @@ from typing import Dict
 
 import numpy as np
 
+from preprocess import normalize_sequence_scale_features
+
 
 LABELS = ("normal", "swap", "occlusion", "lift")
 SEQ_LEN = 60
@@ -53,7 +55,8 @@ def generate_sample(mode: str = "normal", seq_len: int = SEQ_LEN) -> np.ndarray:
     if mode not in LABELS:
         raise ValueError(f"Unsupported mode: {mode}")
 
-    base_weight = np.random.uniform(650, 1500)
+    # 覆盖答辩演示常用的 100-300g 小份果蔬，以及更重的商品。
+    base_weight = np.random.uniform(100, 1800)
     hand_x = np.full(seq_len, np.random.uniform(0.45, 0.55), dtype=np.float32)
     hand_y = np.full(seq_len, np.random.uniform(0.55, 0.72), dtype=np.float32)
     hand_dist = np.zeros(seq_len, dtype=np.float32)
@@ -74,7 +77,7 @@ def generate_sample(mode: str = "normal", seq_len: int = SEQ_LEN) -> np.ndarray:
         occlusion[start_f:end_f] = hand_dist[start_f:end_f] * np.random.uniform(0.15, 0.35)
 
         drop_f = np.random.randint(start_f + 10, min(end_f, start_f + 24))
-        removed_weight = np.random.uniform(120, 420)
+        removed_weight = min(base_weight * np.random.uniform(0.25, 0.85), np.random.uniform(80, 520))
         weight[drop_f:] = base_weight - removed_weight
         weight[drop_f:drop_f + 4] += np.linspace(0, -12, min(4, seq_len - drop_f))
 
@@ -84,8 +87,8 @@ def generate_sample(mode: str = "normal", seq_len: int = SEQ_LEN) -> np.ndarray:
         occlusion[start_f:end_f] = hand_dist[start_f:end_f] * np.random.uniform(0.25, 0.55)
 
         event_f = np.random.randint(start_f + 8, min(end_f - 8, start_f + 24))
-        low_weight = base_weight - np.random.uniform(250, 650)
-        final_weight = base_weight + np.random.uniform(-120, 260)
+        low_weight = max(0.0, base_weight - max(60, base_weight * np.random.uniform(0.45, 1.0)))
+        final_weight = max(20.0, base_weight + np.random.uniform(-0.35, 0.55) * base_weight)
 
         weight[event_f:event_f + 3] = np.linspace(base_weight, low_weight, 3)
         weight[event_f + 3:event_f + 7] = np.linspace(low_weight, final_weight + 60, 4)
@@ -115,7 +118,7 @@ def generate_sample(mode: str = "normal", seq_len: int = SEQ_LEN) -> np.ndarray:
         occlusion[start_f:lift_end] = np.random.uniform(0.35, 0.7, lift_end - start_f)
 
         lift_f = np.random.randint(start_f + 5, min(lift_end - 5, start_f + 22))
-        support_force = np.random.uniform(120, 420)
+        support_force = max(35.0, base_weight * np.random.uniform(0.20, 0.70))
         ramp_len = min(8, seq_len - lift_f)
         weight[lift_f:lift_f + ramp_len] = np.linspace(base_weight, base_weight - support_force, ramp_len)
         if lift_f + ramp_len < seq_len:
@@ -125,7 +128,7 @@ def generate_sample(mode: str = "normal", seq_len: int = SEQ_LEN) -> np.ndarray:
 
     weight_diff = np.diff(weight, prepend=weight[0])
     data = np.stack([hand_x, hand_y, hand_dist, occlusion, weight, weight_diff], axis=1)
-    return _add_sensor_noise(data)
+    return normalize_sequence_scale_features(_add_sensor_noise(data))
 
 
 def build_dataset(
