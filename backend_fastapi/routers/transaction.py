@@ -25,6 +25,7 @@ from core.database import Base, get_db
 from core.order_video import save_payment_before_video
 from core.payment_state import create_payment_order, get_payment_order
 from core.sales_history import sync_sales_history_buckets
+from core.customer_risk import ensure_customer_profile
 from routers.user import ALGORITHM, SECRET_KEY
 
 router = APIRouter(prefix="/api/transaction", tags=["交易与防作弊模块"])
@@ -45,6 +46,8 @@ class TransactionDB(Base):
     profit = Column(Numeric(8, 2), nullable=False, comment="本单利润")
     tag = Column(Integer, nullable=False, default=0, comment="违规标签")
     anti_cheat_tag = Column(String(20), nullable=False, default="normal", comment="防作弊行为标签")
+    customer_id_hash = Column(String(64), nullable=True, comment="顾客唯一标识哈希")
+    customer_platform = Column(String(32), nullable=True, comment="顾客来源平台")
     payment_before_video_path = Column(String(255), nullable=True, comment="支付前 8 秒视频路径")
     manual_check_status = Column(String(20), nullable=False, default="unchecked", comment="人工巡查状态")
     manual_check_note = Column(String(500), nullable=True, comment="管理员备注")
@@ -149,6 +152,8 @@ def get_current_customer(authorization: Optional[str] = Header(default=None)) ->
     return {
         "customer_id": int(customer_id),
         "openid": payload.get("openid"),
+        "customer_id_hash": payload.get("customer_id_hash"),
+        "customer_platform": payload.get("customer_platform") or "mock",
         "subject": payload.get("sub"),
     }
 
@@ -215,6 +220,20 @@ async def create_transaction(
 
     current_time = datetime.now()
     customer_id = customer["customer_id"]
+    customer_platform = customer.get("customer_platform") or "mock"
+    customer_id_hash = customer.get("customer_id_hash")
+    if not customer_id_hash:
+        guest_customer = ensure_customer_profile(
+            db,
+            customer_platform=customer_platform,
+            customer_identifier=f"guest_{customer_id}",
+        )
+        customer_id = int(guest_customer["id"])
+        customer_id_hash = guest_customer["customer_id_hash"]
+        logger.warning(
+            "Order customer has no scan-auth hash; generated guest hash. customer_id=%s",
+            customer_id,
+        )
     transaction_ids = [uuid.uuid4().hex for _ in req.items]
     affected_sales_buckets = []
     try:
@@ -253,6 +272,8 @@ async def create_transaction(
                 profit=item_profit,  # 本单利润
                 tag=item_tag,
                 anti_cheat_tag="normal",
+                customer_id_hash=customer_id_hash,
+                customer_platform=customer_platform,
                 payment_before_video_path=payment_before_video_path,
                 manual_check_status="unchecked",
                 creat_at=current_time
@@ -284,12 +305,16 @@ async def create_transaction(
         qr_code_url=qr_url,
         transaction_ids=transaction_ids,
         payment_channel=req.payment_channel,
+        customer_id_hash=customer_id_hash,
+        customer_platform=customer_platform,
     )
 
     return {
         "order_id": parent_order_id,
         "total_amount": round(backend_total_amount, 2),
         "customer_id": customer_id,
+        "customer_platform": customer_platform,
+        "customer_id_hash": customer_id_hash,
         "openid": customer.get("openid"),
         "payment_status": "pending",
         "payment_url": payment_url,

@@ -28,25 +28,34 @@ class AstraCamera:
         self.cap = None
         self.depth_stream = None
         self.dev = None
+        self.openni_initialized = False
         self.is_mock = False
         self.mode = "astra"
         self.mock_image = None
+        self.init_error = None
+        self.last_color_img = None
 
-        if _env_flag("MOCK_CAMERA"):
-            self._enable_mock("MOCK_CAMERA enabled")
+        if _env_flag("USE_MOCK_HARDWARE") or _env_flag("MOCK_CAMERA"):
+            self._enable_mock("mock hardware enabled")
             return
 
         try:
             self._initialize_astra()
         except Exception as exc:
-            self._enable_mock(f"Astra unavailable: {exc}")
+            self._release_hardware()
+            self.mode = "astra_error"
+            self.init_error = str(exc)
+            print(f"Astra camera init failed: {exc}")
 
     def _initialize_astra(self) -> None:
         if openni2 is None:
             raise RuntimeError("OpenNI2 Python package is unavailable")
 
-        sdk_bin_path = str(PROJECT_ROOT / "backend_fastapi")
+        sdk_bin_path = self._resolve_openni_path(
+            os.getenv("ASTRA_OPENNI_PATH", "").strip() or str(PROJECT_ROOT / "backend_fastapi")
+        )
         openni2.initialize(sdk_bin_path)
+        self.openni_initialized = True
         self.dev = openni2.Device.open_any()
         self.depth_stream = self.dev.create_depth_stream()
         self.depth_stream.start()
@@ -54,7 +63,8 @@ class AstraCamera:
         self.dev.set_image_registration_mode(openni2.IMAGE_REGISTRATION_DEPTH_TO_COLOR)
         self.dev.set_depth_color_sync_enabled(True)
 
-        color_port = int(os.getenv("ASTRA_COLOR_PORT", "1"))
+        color_port_value = os.getenv("RGB_CAMERA_INDEX") or os.getenv("ASTRA_COLOR_PORT") or "1"
+        color_port = int(color_port_value)
         self.cap = cv2.VideoCapture(color_port)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -62,6 +72,16 @@ class AstraCamera:
             raise RuntimeError(f"color camera port {color_port} cannot be opened")
 
         print("Astra Pro Plus camera ready.")
+
+    def _resolve_openni_path(self, sdk_bin_path: str) -> str:
+        path = Path(sdk_bin_path).expanduser()
+        if path.is_absolute():
+            return str(path)
+        for base in (Path.cwd(), PROJECT_ROOT):
+            candidate = (base / path).resolve()
+            if candidate.exists():
+                return str(candidate)
+        return str((PROJECT_ROOT / path).resolve())
 
     def _enable_mock(self, reason: str) -> None:
         self._release_hardware()
@@ -118,18 +138,25 @@ class AstraCamera:
         if self.is_mock:
             return self._get_mock_frames()
 
-        try:
-            ok, color_img = self.cap.read()
-            if not ok or color_img is None:
-                raise RuntimeError("Astra RGB frame read failed")
+        if self.init_error:
+            raise RuntimeError(f"Astra camera is unavailable: {self.init_error}")
 
+        ok, color_img = self.cap.read()
+        if ok and color_img is not None:
+            self.last_color_img = color_img
+        elif self.last_color_img is not None:
+            color_img = self.last_color_img.copy()
+        else:
+            raise RuntimeError("Astra RGB frame read failed")
+
+        try:
             frame = self.depth_stream.read_frame()
             depth_data = np.frombuffer(frame.get_buffer_as_uint16(), dtype=np.uint16)
             depth_img = depth_data.reshape((frame.height, frame.width))
-            return color_img, depth_img
         except Exception as exc:
-            self._enable_mock(f"runtime capture failed: {exc}")
-            return self._get_mock_frames()
+            raise RuntimeError(f"Astra depth frame read failed: {exc}") from exc
+
+        return color_img, depth_img
 
     def _release_hardware(self) -> None:
         try:
@@ -143,12 +170,13 @@ class AstraCamera:
         except Exception:
             pass
         try:
-            if openni2 is not None:
+            if openni2 is not None and self.openni_initialized:
                 openni2.unload()
         except Exception:
             pass
         self.depth_stream = None
         self.cap = None
+        self.openni_initialized = False
 
     def release(self):
         self._release_hardware()
