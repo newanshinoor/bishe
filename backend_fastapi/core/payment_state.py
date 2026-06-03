@@ -19,6 +19,8 @@ def create_payment_order(
     qr_code_url: str,
     transaction_ids: List[str],
     payment_channel: str = "mock_wechat",
+    customer_id_hash: Optional[str] = None,
+    customer_platform: Optional[str] = None,
     expire_seconds: int = 120,
 ) -> Dict[str, Any]:
     """创建一笔待支付的模拟网关订单。"""
@@ -26,6 +28,8 @@ def create_payment_order(
     order = {
         "order_id": order_id,
         "customer_id": customer_id,
+        "customer_id_hash": customer_id_hash,
+        "customer_platform": customer_platform,
         "amount": round(float(amount), 2),
         "status": "pending",
         "payment_channel": payment_channel,

@@ -248,7 +248,9 @@ def get_advanced_monitor():
         query_sales = """
             SELECT SUM(pay_amount) as total_sales, COUNT(transaction_id) as total_orders
             FROM transaction 
-            WHERE DATE(creat_at) = CURDATE() AND tag = 0
+            WHERE DATE(creat_at) = CURDATE()
+              AND tag = 0
+              AND payment_status = 'paid'
         """
         try:
             df_sales = pd.read_sql(query_sales, con=engine)

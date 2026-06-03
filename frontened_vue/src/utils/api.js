@@ -44,6 +44,14 @@ export const updateTransactionManualCheck = (transactionId, payload) => (
   apiClient.put(`/admin/transactions/${encodeURIComponent(transactionId)}/manual-check`, payload)
 );
 
+export const scanPaymentAuth = (payload) => apiClient.post('/payment/scan-auth', payload);
+
+export const getCustomerBlacklist = (params) => apiClient.get('/admin/blacklist', { params });
+
+export const liftCustomerBlacklist = (customerId, payload) => (
+  apiClient.put(`/admin/blacklist/${encodeURIComponent(customerId)}/lift`, payload)
+);
+
 export const getTransactionVideoUrl = (transactionId, videoUrl = '') => {
   const fallbackUrl = `/api/admin/transactions/${encodeURIComponent(transactionId)}/video`;
   return new URL(videoUrl || fallbackUrl, new URL(apiClient.defaults.baseURL).origin).toString();

@@ -7,7 +7,7 @@
         <li :class="{ active: activeTab === 'commodities' }" @click="switchTab('commodities')">📦 商品管理</li>
         <li :class="{ active: activeTab === 'orders' }" @click="switchTab('orders')">🧾 订单流水记录</li>
         <li :class="{ active: activeTab === 'alarms' }" @click="switchTab('alarms')">🚨 违规报警日志</li>
-        <li :class="{ active: activeTab === 'settings' }" @click="switchTab('settings')">⚙️ 防作弊参数设置</li>
+        <li :class="{ active: activeTab === 'blacklist' }" @click="switchTab('blacklist')">⛔ 顾客黑名单</li>
         <li :class="{ active: activeTab === 'monitor' }" @click="switchTab('monitor')">🖥️ 数字大屏</li>
       </ul>
     </aside>
@@ -18,7 +18,7 @@
           {{ activeTab === 'dashboard' ? '销售与运营仪表盘' :
              activeTab === 'commodities' ? '商品档案与库存管理' :
              activeTab === 'alarms' ? 'LSTM 监控报警中心' :
-             activeTab === 'settings' ? '防作弊参数设置' : '订单流水与异常行为检测' }}
+             activeTab === 'blacklist' ? '顾客黑名单管理' : '订单流水与异常行为检测' }}
         </h1>
         <div class="user-info">管理员：饶程</div>
       </header>
@@ -216,51 +216,74 @@
         </div>
       </div>
 
-      <div v-if="activeTab === 'settings'" class="tab-content">
-        <div class="table-card config-panel">
-          <div class="config-heading">
+      <div v-if="activeTab === 'blacklist'" class="tab-content">
+        <div class="table-card border-t-4 border-red-500">
+          <div class="table-header-actions">
             <div>
-              <h3>防作弊策略阈值</h3>
-              <p>修改后会立即下发到柜端实时识别循环，无需重启服务。</p>
+              <h3 style="color: #cf1322;">顾客黑名单</h3>
+              <p style="font-size: 13px; color: #888; margin-top: 5px;">仅展示顾客哈希和来源订单，不保存明文顾客标识。</p>
             </div>
-            <button class="btn-config-refresh" @click="fetchAntiCheatConfig">刷新当前值</button>
+            <div class="filter-actions">
+              <select v-model="blacklistFilters.status" class="tag-select" @change="fetchBlacklist">
+                <option value="active">生效中</option>
+                <option value="lifted">已解除</option>
+                <option value="all">全部</option>
+              </select>
+              <button class="btn-success" @click="fetchBlacklist">↻ 刷新黑名单</button>
+            </div>
           </div>
 
-          <div class="config-grid">
-            <label class="config-field">
-              <span>LSTM 告警置信度阈值</span>
-              <input v-model.number="antiCheatConfig.anti_cheat_threshold" type="number" min="0" max="1" step="0.01" />
-              <small>范围 0 到 1。降低后更敏感，提高后误报更少。</small>
-            </label>
-
-            <label class="config-field">
-              <span>遮挡持续时间阈值</span>
-              <input v-model.number="antiCheatConfig.occlusion_duration_threshold" type="number" min="0.1" step="0.1" />
-              <small>单位：秒。手部关键点在 ROI 内持续超过该时间才报警。</small>
-            </label>
-
-            <label class="config-field">
-              <span>YOLO 有效框置信度阈值</span>
-              <input v-model.number="antiCheatConfig.min_confidence_threshold" type="number" min="0" max="1" step="0.01" />
-              <small>范围 0 到 1。低于该值的目标不参与多商品判断。</small>
-            </label>
-          </div>
-
-          <p v-if="configError" class="config-message error">{{ configError }}</p>
-          <p v-if="configSuccess" class="config-message success">{{ configSuccess }}</p>
-
-          <div class="config-actions">
-            <button class="btn-save" :disabled="configSaving" @click="saveAntiCheatConfig">
-              {{ configSaving ? '保存中...' : '保存并立即生效' }}
-            </button>
-          </div>
+          <table class="styled-table">
+            <thead>
+              <tr>
+                <th>顾客哈希</th>
+                <th>脱敏 ID</th>
+                <th>平台</th>
+                <th>来源订单</th>
+                <th>拉黑原因</th>
+                <th>证据视频</th>
+                <th>状态</th>
+                <th>首次出现</th>
+                <th>创建时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="item in blacklistList" :key="item.id">
+                <td class="font-mono text-xs">{{ shortHash(item.customer_id_hash) }}</td>
+                <td class="font-mono text-xs">{{ item.masked_identifier || '-' }}</td>
+                <td>{{ item.customer_platform }}</td>
+                <td class="font-mono text-xs">{{ item.source_transaction_id || '-' }}</td>
+                <td>{{ item.reason || '-' }}</td>
+                <td>
+                  <button
+                    class="btn-action video"
+                    :disabled="!item.source_transaction_id"
+                    @click="openOrderVideo({ transaction_id: item.source_transaction_id, payment_before_video_url: item.source_transaction_id ? `/api/admin/transactions/${item.source_transaction_id}/video` : '' })"
+                  >查看证据</button>
+                </td>
+                <td><span :class="['status-tag', item.status === 'active' ? 'anomaly-occlusion' : 'normal']">{{ item.status === 'active' ? '生效中' : '已解除' }}</span></td>
+                <td style="color: #888; font-size: 13px;">{{ item.first_seen_at || '-' }}</td>
+                <td style="color: #888; font-size: 13px;">{{ item.created_at || '-' }}</td>
+                <td>
+                  <button class="btn-action success" :disabled="item.status !== 'active'" @click="liftBlacklist(item)">解除黑名单</button>
+                </td>
+              </tr>
+              <tr v-if="blacklistList.length === 0">
+                <td colspan="10" style="text-align: center; padding: 40px; color: #999;">暂无黑名单记录</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
       <div v-show="activeTab === 'monitor'" class="w-full text-white font-sans p-6 rounded-lg min-h-full">
         <header class="flex justify-between items-center mb-6 border-b border-gray-700 pb-4">
           <h1 class="text-2xl font-bold text-blue-400 tracking-wider">数字监控中心 - 历史数据与动态定价 <span class="inline-block w-2 h-2 bg-green-500 rounded-full animate-pulse ml-2"></span></h1>
-          <div class="text-gray-300 text-sm flex items-center">管理员：饶程</div>
+          <div class="text-gray-300 text-sm flex items-center gap-3">
+            <button class="monitor-config-open" @click="openMonitorConfig">模型参数调整</button>
+            <span>管理员：饶程</span>
+          </div>
         </header>
 
         <div class="grid grid-cols-4 gap-6">
@@ -344,6 +367,44 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="showMonitorConfigDialog" title="模型参数调整" width="760px">
+      <div class="config-dialog-body">
+        <div class="config-dialog-heading">
+          <p>调整后立即下发到柜端实时识别循环，无需重启服务。</p>
+          <button class="btn-config-refresh" @click="fetchAntiCheatConfig">刷新当前值</button>
+        </div>
+
+        <div class="config-grid dialog-config-grid">
+          <label class="config-field">
+            <span>LSTM 告警置信度阈值</span>
+            <input v-model.number="antiCheatConfig.anti_cheat_threshold" type="number" min="0" max="1" step="0.01" />
+            <small>范围 0 到 1。降低后更敏感，提高后误报更少。</small>
+          </label>
+
+          <label class="config-field">
+            <span>遮挡持续时间阈值</span>
+            <input v-model.number="antiCheatConfig.occlusion_duration_threshold" type="number" min="0.1" step="0.1" />
+            <small>单位：秒。手部关键点在 ROI 内持续超过该时间才报警。</small>
+          </label>
+
+          <label class="config-field">
+            <span>YOLO 有效框置信度阈值</span>
+            <input v-model.number="antiCheatConfig.min_confidence_threshold" type="number" min="0" max="1" step="0.01" />
+            <small>范围 0 到 1。低于该值的目标不参与多商品判断。</small>
+          </label>
+        </div>
+
+        <p v-if="configError" class="config-message error">{{ configError }}</p>
+        <p v-if="configSuccess" class="config-message success">{{ configSuccess }}</p>
+      </div>
+      <template #footer>
+        <button class="btn-cancel" @click="showMonitorConfigDialog = false">关闭</button>
+        <button class="btn-save" :disabled="configSaving" @click="saveAntiCheatConfig">
+          {{ configSaving ? '保存中...' : '保存并立即生效' }}
+        </button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="showAbnormalCheckDialog" title="标记异常订单" width="520px">
       <div class="abnormal-check-form">
         <label>异常类型</label>
@@ -355,6 +416,10 @@
         </select>
         <label>管理员备注</label>
         <textarea v-model.trim="abnormalCheckForm.note" maxlength="500" rows="4" placeholder="请输入巡查备注"></textarea>
+        <label class="checkbox-line">
+          <input v-model="abnormalCheckForm.blacklist_customer" type="checkbox" />
+          同时将该顾客加入黑名单
+        </label>
       </div>
       <template #footer>
         <button class="btn-cancel" @click="showAbnormalCheckDialog = false">取消</button>
@@ -440,7 +505,9 @@ import * as echarts from 'echarts';
 import { ElDialog, ElMessage } from 'element-plus';
 import 'element-plus/dist/index.css';
 import api, {
+  getCustomerBlacklist,
   getAdminTransactions,
+  liftCustomerBlacklist,
   getTransactionVideoUrl,
   updateTransactionManualCheck
 } from '../utils/api';
@@ -481,8 +548,10 @@ const currentOrderVideoUrl = ref('');
 const orderVideoError = ref('');
 const orderVideoRef = ref(null);
 const showAbnormalCheckDialog = ref(false);
-const abnormalCheckForm = ref({ transaction_id: '', anti_cheat_tag: 'abnormal', note: '' });
+const abnormalCheckForm = ref({ transaction_id: '', anti_cheat_tag: 'abnormal', note: '', blacklist_customer: false });
 const manualCheckSaving = ref(false);
+const blacklistList = ref([]);
+const blacklistFilters = ref({ status: 'active' });
 
 // ========== 🌟 新增：报警日志状态 ==========
 const alarmList = ref([]);
@@ -506,6 +575,7 @@ const antiCheatConfig = ref({
 const configError = ref('');
 const configSuccess = ref('');
 const configSaving = ref(false);
+const showMonitorConfigDialog = ref(false);
 
 // ========== 大屏状态 ==========
 const monitorData = ref({ today_sales: 0, today_orders: 0, alerts: [], pricing: [], history_chart: null });
@@ -531,10 +601,12 @@ const switchTab = async (tabName) => {
   } else if (tabName === 'alarms') {
     // 🌟 触发获取报警日志
     fetchAlarms();
-  } else if (tabName === 'settings') {
-    fetchAntiCheatConfig();
+  } else if (tabName === 'blacklist') {
+    fetchBlacklist();
   } else if (tabName === 'monitor') {
-    await nextTick(); fetchMonitorData();
+    await nextTick();
+    fetchMonitorData();
+    fetchAntiCheatConfig();
   }
 };
 
@@ -582,6 +654,13 @@ const saveAntiCheatConfig = async () => {
   } finally {
     configSaving.value = false;
   }
+};
+
+const openMonitorConfig = async () => {
+  configError.value = '';
+  configSuccess.value = '';
+  showMonitorConfigDialog.value = true;
+  await fetchAntiCheatConfig();
 };
 
 // ================= 🌟 报警日志获取、实时弹窗与证据预览逻辑 =================
@@ -767,6 +846,33 @@ const getAntiCheatTagText = (tag) => ({
 const getAntiCheatTagClass = (tag) => tag === 'normal' ? 'normal' : tag === 'swap' ? 'anomaly-swap' : 'anomaly-occlusion';
 const getManualCheckText = (status) => ({ unchecked: '未巡查', normal: '已标正常', abnormal: '已标异常' }[status] || '未巡查');
 const getManualCheckClass = (status) => status === 'normal' ? 'normal' : status === 'abnormal' ? 'anomaly-occlusion' : 'unchecked';
+const shortHash = (value = '') => {
+  const text = String(value || '');
+  return text.length > 18 ? `${text.slice(0, 12)}...${text.slice(-6)}` : text || '-';
+};
+const fetchBlacklist = async () => {
+  try {
+    const r = await getCustomerBlacklist({
+      status: blacklistFilters.value.status,
+      page: 1,
+      page_size: 100
+    });
+    blacklistList.value = r.data.items || [];
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '获取顾客黑名单失败');
+  }
+};
+const liftBlacklist = async (item) => {
+  const liftReason = prompt('请输入解除黑名单原因', '管理员复核解除');
+  if (liftReason === null) return;
+  try {
+    await liftCustomerBlacklist(item.id, { lift_reason: liftReason });
+    ElMessage.success('黑名单已解除');
+    await fetchBlacklist();
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '解除黑名单失败');
+  }
+};
 const fetchOrders = async ({ resetPage = false } = {}) => {
   if (resetPage) orderPagination.value.page = 1;
   orderLoading.value = true;
@@ -837,7 +943,7 @@ const markOrderNormal = async (order) => {
   }
 };
 const openAbnormalCheck = (order) => {
-  abnormalCheckForm.value = { transaction_id: order.transaction_id, anti_cheat_tag: 'abnormal', note: '' };
+  abnormalCheckForm.value = { transaction_id: order.transaction_id, anti_cheat_tag: 'abnormal', note: '', blacklist_customer: false };
   showAbnormalCheckDialog.value = true;
 };
 const submitAbnormalCheck = async () => {
@@ -846,11 +952,13 @@ const submitAbnormalCheck = async () => {
     await updateTransactionManualCheck(abnormalCheckForm.value.transaction_id, {
       status: 'abnormal',
       anti_cheat_tag: abnormalCheckForm.value.anti_cheat_tag,
-      note: abnormalCheckForm.value.note
+      note: abnormalCheckForm.value.note,
+      blacklist_customer: abnormalCheckForm.value.blacklist_customer
     });
     showAbnormalCheckDialog.value = false;
-    ElMessage.success('异常标记已保存');
+    ElMessage.success(abnormalCheckForm.value.blacklist_customer ? '异常标记已保存，顾客黑名单已更新' : '异常标记已保存');
     await fetchOrders();
+    if (activeTab.value === 'blacklist') await fetchBlacklist();
   } catch (error) {
     ElMessage.error(error.response?.data?.detail || '异常标记失败');
   } finally {
@@ -923,6 +1031,23 @@ onBeforeUnmount(() => {
 .config-message.success { border: 1px solid #b7eb8f; background: #f6ffed; color: #389e0d; }
 .btn-config-refresh { padding: 8px 14px; border: 1px solid #1890ff; border-radius: 4px; background: #fff; color: #1890ff; cursor: pointer; font-weight: 700; }
 .btn-config-refresh:hover { background: #e6f7ff; }
+
+.monitor-config-open {
+  padding: 8px 14px;
+  border: 1px solid rgba(96, 165, 250, 0.55);
+  border-radius: 6px;
+  background: #2563eb;
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28);
+}
+.monitor-config-open:hover { background: #3b82f6; }
+.config-dialog-body { padding: 4px 2px 0; }
+.config-dialog-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; }
+.config-dialog-heading p { margin: 0; color: #666; font-size: 13px; }
+.dialog-config-grid { grid-template-columns: 1fr; }
 
 /* 🌟 新增：违规监控弹窗专属样式 */
 .evidence-box {
@@ -1227,6 +1352,8 @@ onBeforeUnmount(() => {
 .abnormal-check-form label { color: #555; font-size: 14px; font-weight: bold; }
 .abnormal-check-form select, .abnormal-check-form textarea { padding: 9px 10px; border: 1px solid #d9d9d9; border-radius: 4px; outline: none; font: inherit; }
 .abnormal-check-form textarea { resize: vertical; }
+.abnormal-check-form .checkbox-line { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border: 1px solid #ffe58f; border-radius: 5px; background: #fffbe6; color: #ad6800; }
+.abnormal-check-form .checkbox-line input { width: auto; }
 .order-video-player { display: block; width: 100%; max-height: 65vh; border-radius: 6px; background: #111827; }
 .font-mono { font-family: monospace; color: #888;}
 .text-weight { color: #fa8c16; font-weight: bold;}

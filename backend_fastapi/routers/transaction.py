@@ -25,6 +25,7 @@ from core.database import Base, get_db
 from core.order_video import save_payment_before_video
 from core.payment_state import create_payment_order, get_payment_order
 from core.sales_history import sync_sales_history_buckets
+from core.customer_risk import ensure_customer_profile
 from routers.user import ALGORITHM, SECRET_KEY
 
 router = APIRouter(prefix="/api/transaction", tags=["交易与防作弊模块"])
@@ -38,6 +39,10 @@ class TransactionDB(Base):
     __tablename__ = "transaction"
 
     transaction_id = Column(String(32), primary_key=True, index=True, comment="交易流水单号")
+    payment_order_id = Column(String(32), nullable=True, index=True, comment="支付订单号")
+    payment_status = Column(String(20), nullable=False, default="pending", comment="支付状态")
+    paid_at = Column(DateTime, nullable=True, comment="支付完成时间")
+    inventory_deducted_at = Column(DateTime, nullable=True, comment="库存扣减时间")
     customer_id = Column(Integer, nullable=False, comment="购买顾客编号")
     product_name = Column(String(50), nullable=False, comment="售卖果蔬名")
     total_amount = Column(Numeric(8, 2), nullable=False, comment="交易原始总重")
@@ -45,6 +50,8 @@ class TransactionDB(Base):
     profit = Column(Numeric(8, 2), nullable=False, comment="本单利润")
     tag = Column(Integer, nullable=False, default=0, comment="违规标签")
     anti_cheat_tag = Column(String(20), nullable=False, default="normal", comment="防作弊行为标签")
+    customer_id_hash = Column(String(64), nullable=True, comment="顾客唯一标识哈希")
+    customer_platform = Column(String(32), nullable=True, comment="顾客来源平台")
     payment_before_video_path = Column(String(255), nullable=True, comment="支付前 8 秒视频路径")
     manual_check_status = Column(String(20), nullable=False, default="unchecked", comment="人工巡查状态")
     manual_check_note = Column(String(500), nullable=True, comment="管理员备注")
@@ -149,6 +156,8 @@ def get_current_customer(authorization: Optional[str] = Header(default=None)) ->
     return {
         "customer_id": int(customer_id),
         "openid": payload.get("openid"),
+        "customer_id_hash": payload.get("customer_id_hash"),
+        "customer_platform": payload.get("customer_platform") or "mock",
         "subject": payload.get("sub"),
     }
 
@@ -200,6 +209,40 @@ def _calculate_backend_item_pay_amount(db: Session, item: Dict[str, Any]) -> tup
     return item_weight, round(item_weight * item_unit_price, 2)
 
 
+def _validate_cart_inventory_available(db: Session, items: List[Dict[str, Any]]) -> None:
+    """Pre-check stock before generating a payment QR code."""
+    required_by_product: Dict[str, float] = {}
+    for item in items:
+        product_name = str(item.get("name", "")).strip()
+        weight = max(0.0, float(item.get("weight", 0)))
+        if not product_name or weight <= 0:
+            continue
+        required_by_product[product_name] = round(
+            required_by_product.get(product_name, 0.0) + weight,
+            2,
+        )
+
+    for product_name, required_weight in required_by_product.items():
+        current_inventory = db.execute(
+            text(
+                """
+                SELECT inventory
+                FROM fruit_inventory
+                WHERE item_name = :item_name
+                LIMIT 1
+                """
+            ),
+            {"item_name": product_name},
+        ).scalar()
+        if current_inventory is None:
+            raise ValueError(f"库存表中不存在商品：{product_name}")
+        current_inventory = float(current_inventory)
+        if current_inventory + 1e-9 < required_weight:
+            raise ValueError(
+                f"{product_name} 库存不足：当前 {current_inventory:.2f}kg，需要 {required_weight:.2f}kg"
+            )
+
+
 @router.post("/create")
 async def create_transaction(
     req: OrderCreateReq,
@@ -215,8 +258,26 @@ async def create_transaction(
 
     current_time = datetime.now()
     customer_id = customer["customer_id"]
+    customer_platform = customer.get("customer_platform") or "mock"
+    customer_id_hash = customer.get("customer_id_hash")
+    if not customer_id_hash:
+        guest_customer = ensure_customer_profile(
+            db,
+            customer_platform=customer_platform,
+            customer_identifier=f"guest_{customer_id}",
+        )
+        customer_id = int(guest_customer["id"])
+        customer_id_hash = guest_customer["customer_id_hash"]
+        logger.warning(
+            "Order customer has no scan-auth hash; generated guest hash. customer_id=%s",
+            customer_id,
+        )
+    try:
+        _validate_cart_inventory_available(db, req.items)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
     transaction_ids = [uuid.uuid4().hex for _ in req.items]
-    affected_sales_buckets = []
     try:
         video_result = await asyncio.to_thread(
             save_payment_before_video,
@@ -246,6 +307,8 @@ async def create_transaction(
 
             new_tx = TransactionDB(
                 transaction_id=tx_id,
+                payment_order_id=parent_order_id,
+                payment_status="pending",
                 customer_id=customer_id,
                 product_name=item.get("name", "未知商品"),
                 total_amount=item_weight,  # 交易原始总重
@@ -253,15 +316,15 @@ async def create_transaction(
                 profit=item_profit,  # 本单利润
                 tag=item_tag,
                 anti_cheat_tag="normal",
+                customer_id_hash=customer_id_hash,
+                customer_platform=customer_platform,
                 payment_before_video_path=payment_before_video_path,
                 manual_check_status="unchecked",
                 creat_at=current_time
             )
             db.add(new_tx)
-            affected_sales_buckets.append((new_tx.product_name, current_time))
 
         db.flush()
-        sync_sales_history_buckets(db, affected_sales_buckets)
         db.commit()
     except Exception as e:
         db.rollback()
@@ -284,12 +347,16 @@ async def create_transaction(
         qr_code_url=qr_url,
         transaction_ids=transaction_ids,
         payment_channel=req.payment_channel,
+        customer_id_hash=customer_id_hash,
+        customer_platform=customer_platform,
     )
 
     return {
         "order_id": parent_order_id,
         "total_amount": round(backend_total_amount, 2),
         "customer_id": customer_id,
+        "customer_platform": customer_platform,
+        "customer_id_hash": customer_id_hash,
         "openid": customer.get("openid"),
         "payment_status": "pending",
         "payment_url": payment_url,
@@ -300,13 +367,32 @@ async def create_transaction(
 
 
 @router.get("/status/{order_id}")
-async def get_transaction_status(order_id: str):
+async def get_transaction_status(order_id: str, db: Session = Depends(get_db)):
     """
     前端轮询支付状态
     """
     order = get_payment_order(order_id)
     if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+        row = db.execute(
+            text(
+                """
+                SELECT payment_status, customer_id, paid_at
+                FROM `transaction`
+                WHERE payment_order_id = :order_id
+                ORDER BY creat_at DESC
+                LIMIT 1
+                """
+            ),
+            {"order_id": order_id},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Order not found")
+        return {
+            "status": "completed" if row["payment_status"] == "paid" else row["payment_status"],
+            "order_id": order_id,
+            "customer_id": row["customer_id"],
+            "paid_at": row["paid_at"].isoformat(timespec="seconds") if row["paid_at"] else None,
+        }
 
     return {
         "status": order["status"],
@@ -338,6 +424,8 @@ async def get_transaction_list(tag: int = None, db: Session = Depends(get_db)):
         for r in records:
             result.append({
                 "transaction_id": r.transaction_id,
+                "payment_order_id": r.payment_order_id,
+                "payment_status": r.payment_status or "paid",
                 "customer_id": r.customer_id,
                 "product_name": r.product_name,
                 "total_amount": float(r.total_amount),  # 原始总重

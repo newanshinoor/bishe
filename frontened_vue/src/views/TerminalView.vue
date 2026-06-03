@@ -35,7 +35,10 @@
         </div>
         <div class="current-item-panel" v-else-if="isRecognizing && currentDetected">
           <div class="item-info">
-            <h3>识别结果: {{ currentDetected.name }} ({{ currentDetected.freshness }})</h3>
+            <h3>
+              识别结果: {{ currentDetected.name }} ({{ currentDetected.freshness }})
+              <span v-if="currentDetected.confidence">｜置信度: {{ (currentDetected.confidence * 100).toFixed(1) }}%</span>
+            </h3>
             <div class="specs">
               <span class="spec-block">单价: <b>¥{{ currentDetected.unitPrice.toFixed(2) }}/kg</b></span>
               <span class="spec-block highlight">实时重量: <b>{{ currentDetected.weight.toFixed(2) }} kg</b></span>
@@ -73,6 +76,15 @@
           </li>
         </ul>
         <div class="total-wrapper">
+          <div class="mock-customer-box">
+            <label>模拟扫码顾客</label>
+            <select v-model="mockCustomerId">
+              <option value="CUSTOMER_001">CUSTOMER_001</option>
+              <option value="CUSTOMER_002">CUSTOMER_002</option>
+              <option value="CUSTOMER_003">CUSTOMER_003</option>
+            </select>
+            <input v-model.trim="mockCustomerId" type="text" placeholder="或输入自定义顾客 ID" />
+          </div>
           <div class="total">
             总计: <span>¥{{ cartTotalPrice }}</span>
           </div>
@@ -267,6 +279,7 @@ const currentOrderId = ref('');
 const qrCodeUrl = ref('');
 const paymentStatus = ref('pending'); // pending, success
 const paymentMethod = ref('wechat');  // 'wechat' or 'alipay'
+const mockCustomerId = ref('CUSTOMER_001');
 const timeLeft = ref(119);
 let pollingInterval = null;
 let countdownInterval = null;
@@ -316,7 +329,7 @@ const toggleRecognition = async () => {
         hasMultiItemError.value = true;
         multiItemMessage.value = data.message || '检测到多种果蔬，请一次仅放置一种商品称重';
         currentDetected.value = null;
-      } else if (data.stable_result) {
+      } else if (data.stable_result && data.stable_result.status === 'stable') {
         hasMultiItemError.value = false;
         multiItemMessage.value = '';
         recognitionHint.value = '';
@@ -365,13 +378,20 @@ const toggleRecognition = async () => {
 };
 
 const getRecognitionHint = (data) => {
-  if (data.recognition_status === 'low_confidence') {
-    return '识别置信度较低，请调整商品位置或光照';
-  }
-  if (!data.weight_stable) {
-    return '正在稳定称重';
-  }
-  return data.recognition_message || '正在确认商品类别，请保持商品静止';
+  const status = data.recognition_status || data.status || data.item_status;
+  const hints = {
+    waiting_weight: '正在稳定称重，请稍候',
+    waiting_detection: '正在稳定识别，请保持商品不动',
+    waiting: '正在稳定识别，请保持商品不动',
+    low_confidence: '识别置信度较低，请重新摆放商品',
+    multi_item_error: '检测到多种果蔬，请一次仅放置一种商品称重',
+    occlusion_detected: '检测到遮挡，请移开手部或遮挡物',
+    target_not_on_scale: '请将商品放置到秤面中央',
+    invalid_depth: '深度数据不可用，请检查深度相机',
+    depth_out_of_range: '商品距离超出有效深度范围',
+    no_object: '未检测到商品'
+  };
+  return hints[status] || data.recognition_message || data.message || '正在稳定识别，请保持商品不动';
 };
 
 const parseStableResult = (item, currentWeight) => {
@@ -380,26 +400,19 @@ const parseStableResult = (item, currentWeight) => {
     return;
   }
 
-  let label = item.label;
-  let displayName = label;
-  let freshness = '未知';
-  let unitPrice = 0;
-
-  if (label.toLowerCase().includes('apple')) { displayName = '苹果'; unitPrice = 4.5; }
-  else if (label.toLowerCase().includes('tomato')) { displayName = '番茄'; unitPrice = 3.2; }
-  else if (label.toLowerCase().includes('mango')) { displayName = '芒果'; unitPrice = 8.5; }
-  else if (label.toLowerCase().includes('orange')) { displayName = '橙子'; unitPrice = 5.0; }
-
-  if (label.toLowerCase().includes('fresh')) { freshness = '新鲜'; }
-  else if (label.toLowerCase().includes('rotten')) { freshness = '腐烂'; unitPrice = 0; }
-  else if (label.toLowerCase().includes('blemish')) { freshness = '瑕疵'; unitPrice = unitPrice * 0.5; }
+  const displayName = item.display_name || item.name || item.label || '未识别商品';
+  const freshness = item.freshness || '普通';
+  const unitPrice = Number(item.unit_price ?? item.unitPrice ?? 0);
+  const weight = Number(item.weight ?? item.weight_kg ?? currentWeight ?? 0);
+  const totalPrice = Number(item.total_price ?? (unitPrice * weight));
 
   currentDetected.value = {
     name: displayName,
     freshness: freshness,
     unitPrice: unitPrice,
-    weight: currentWeight,
-    totalPrice: unitPrice * currentWeight
+    weight,
+    totalPrice,
+    confidence: Number(item.confidence ?? item.conf ?? 0)
   };
 };
 
@@ -434,21 +447,49 @@ const handleCheckout = async () => {
   if (cartItems.value.length === 0) return;
 
   try {
-    // 1. 模拟扫码授权，拿到包含 openid/customer_id 的 Token
+    const customerIdentifier = (mockCustomerId.value || 'CUSTOMER_001').trim();
+    const paymentNo = `PAY_${Date.now()}`;
+    const scanAuthResponse = await fetch('http://localhost:8000/api/payment/scan-auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        payment_no: paymentNo,
+        customer_platform: 'mock',
+        customer_identifier: customerIdentifier
+      })
+    });
+    const scanAuthData = await scanAuthResponse.json();
+    if (scanAuthData.status === 'blocked') {
+      alert(scanAuthData.message || '该顾客存在异常交易记录，请联系管理员');
+      return;
+    }
+    if (scanAuthData.status !== 'ok') {
+      throw new Error(scanAuthData.detail || scanAuthData.message || '扫码风控校验失败');
+    }
+
+    // 1. 模拟扫码授权，拿到包含 openid/customer_id/customer_id_hash 的 Token
     const authResponse = await fetch('http://localhost:8000/api/payment/mock-login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        scene: `terminal_${Date.now()}`,
-        nickname: '无人售卖顾客'
+        scene: paymentNo,
+        nickname: '无人售卖顾客',
+        customer_platform: 'mock',
+        mock_customer_id: customerIdentifier
       })
     });
     const authData = await authResponse.json();
+    if (authData.status === 'blocked') {
+      alert(authData.message || '该顾客存在异常交易记录，请联系管理员');
+      return;
+    }
     if (authData.status !== 'success') throw new Error('模拟授权失败');
 
     localStorage.setItem('token', authData.token);
     localStorage.setItem('customer_id', String(authData.customer_id));
     localStorage.setItem('openid', authData.openid);
+    localStorage.setItem('customer_platform', authData.customer_platform || 'mock');
+    localStorage.setItem('customer_id_hash', authData.customer_id_hash || scanAuthData.customer_id_hash || '');
 
     // 2. 请求后端生成订单，Authorization 中携带顾客身份
     const response = await fetch('http://localhost:8000/api/transaction/create', {
@@ -479,7 +520,7 @@ const handleCheckout = async () => {
     startPollingStatus();
   } catch (error) {
     console.error("订单创建失败", error);
-    alert("系统繁忙，请稍后再试");
+    alert(error.message || "系统繁忙，请稍后再试");
   }
 };
 
@@ -743,6 +784,10 @@ onBeforeUnmount(() => {
 .terminal-container { display: flex; gap: 20px; padding: 20px; background-color: #fff; }
 .camera-section { flex: 2; display: flex; flex-direction: column; border: 1px solid #ddd; padding: 20px; border-radius: 8px; }
 .cart-section { flex: 1; display: flex; flex-direction: column; border: 1px solid #ddd; padding: 20px; border-radius: 8px; background-color: #f9f9f9; }
+.mock-customer-box { display: grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 14px; padding: 12px; border: 1px dashed #b7d7ff; border-radius: 8px; background: #f0f7ff; }
+.mock-customer-box label { font-size: 13px; font-weight: 700; color: #1d4ed8; }
+.mock-customer-box select, .mock-customer-box input { width: 100%; padding: 8px 10px; border: 1px solid #bfdbfe; border-radius: 5px; background: #fff; outline: none; }
+.mock-customer-box select:focus, .mock-customer-box input:focus { border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12); }
 .video-placeholder { flex: 1; width: 100%; background: #222; display: flex; justify-content: center; align-items: center; color: white; margin: 15px 0; border-radius: 8px; overflow: hidden; position: relative; user-select: none; }
 .ws-video { width: 100%; height: 100%; object-fit: contain; }
 .roi-box { position: absolute; border: 2px solid #22d3ee; background: rgba(34, 211, 238, 0.18); box-shadow: 0 0 0 9999px rgba(0,0,0,0.12); pointer-events: none; z-index: 4; }

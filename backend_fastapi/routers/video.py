@@ -16,6 +16,7 @@ import cv2
 import requests
 from fastapi import APIRouter, WebSocket
 from pydantic import BaseModel
+from sqlalchemy import text
 
 # 兼容不同启动目录：
 # - 从 backend_fastapi 启动时，需要项目根目录才能导入 model_training；
@@ -27,11 +28,13 @@ for path in (BASE_DIR, PROJECT_ROOT):
         sys.path.append(path)
 
 from core.camera_driver import AstraCamera
-from core.detector_4d import FruitDetector4D, analyze_detected_items
+from core.depth_validator import DepthValidator
+from core.detection_analysis import analyze_detected_items
+from core.detector_rgb import RGBFruitDetector
+from core.fruit_detection_stabilizer import FruitDetectionStabilizer
 from core.alarm_log import AlarmLog
 from core.database import SessionLocal
 from core.order_video import cache_order_video_frame
-from core.recognition_stabilizer import FruitDetectionStabilizer
 from core.realtime_anti_cheat import RealtimeOcclusionGuard, RealtimeWeightGuard
 from core.scale_driver import RealTimeScale
 from core.system_config import get_runtime_config
@@ -55,6 +58,12 @@ class HandOverlayReq(BaseModel):
 
 # BASE_DIR 指向 backend_fastapi，方便拼接模型、接口等项目内路径。
 MODEL_PATH = os.path.join(BASE_DIR, "routers", "weights", "best.pt")
+DETECTOR_MODE = os.getenv("DETECTOR_MODE", "rgb_depth_aux").strip().lower()
+
+try:
+    STREAM_JPEG_QUALITY = max(1, min(100, int(os.getenv("STREAM_JPEG_QUALITY", "90"))))
+except (TypeError, ValueError):
+    STREAM_JPEG_QUALITY = 90
 
 # 异常证据视频保存目录：backend_fastapi/static/alarms/
 ALARM_DIR = os.path.join(BASE_DIR, "static", "alarms")
@@ -88,6 +97,12 @@ OCCLUSION_CANDIDATE_SECONDS = 0.8
 # 普通结果立即覆盖告警，导致前端只能看到一帧。
 WEIGHT_GUARD_ALERT_SECONDS = 2.0
 
+# Suppress swap/lift when the scale is effectively empty. A hand-only frame can
+# look like a swap sequence to the LSTM, but transaction anti-cheat requires a
+# real weighted item on the scale.
+MIN_OBJECT_WEIGHT_GRAMS = float(os.getenv("MIN_OBJECT_WEIGHT_GRAMS", "30"))
+WEIGHT_REQUIRED_LSTM_PREDICTIONS = {"swap", "lift"}
+
 # HTTP 请求必须放到线程池中执行，避免 requests.post 阻塞事件循环，
 # 从而保证 WebSocket 视频流和重量数据持续推送。
 VERIFY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="anti-cheat")
@@ -101,10 +116,11 @@ ALARM_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="alarm-evi
 # 全局硬件与算法模块初始化
 # =========================
 
-# 摄像头、4D YOLO 检测器、电子秤按原有逻辑全局初始化。
+# 摄像头、RGB YOLO 检测器、Depth 校验器、电子秤全局初始化。
 camera = AstraCamera()
-detector = FruitDetector4D(MODEL_PATH)
-scale = RealTimeScale(port="COM5", baud=115200)
+detector = RGBFruitDetector()
+depth_validator = DepthValidator()
+scale = RealTimeScale()
 
 # LSTM 多模态防作弊模块：
 # vision 负责从视频帧提取手部/遮挡特征；
@@ -168,6 +184,17 @@ def _install_scale_get_features_if_missing() -> None:
 
 
 _install_scale_get_features_if_missing()
+
+
+def _has_weighted_item(raw_weight: float) -> bool:
+    return max(0.0, float(raw_weight)) >= MIN_OBJECT_WEIGHT_GRAMS
+
+
+def _should_suppress_empty_scale_prediction(prediction: str, raw_weight: float) -> bool:
+    return (
+        prediction in WEIGHT_REQUIRED_LSTM_PREDICTIONS
+        and not _has_weighted_item(raw_weight)
+    )
 
 
 def _post_verify_request(sequence: list[list[float]]) -> Dict[str, Any]:
@@ -363,6 +390,57 @@ def _build_security_signal(is_secure: bool, prediction: str) -> Dict[str, str]:
     }
 
 
+TERMINAL_PRICE_FALLBACK = {
+    "苹果": 4.5,
+    "西红柿": 3.2,
+    "芒果": 8.5,
+    "橙子": 5.0,
+    "香蕉": 3.5,
+    "黄瓜": 2.8,
+    "草莓": 12.0,
+    "葡萄": 10.0,
+    "土豆": 2.0,
+    "西瓜": 3.0,
+}
+
+
+def _resolve_unit_price(display_name: str, freshness: str) -> float:
+    db = SessionLocal()
+    try:
+        unit_price = db.execute(
+            text("SELECT price FROM fruit_inventory WHERE item_name = :item_name LIMIT 1"),
+            {"item_name": display_name},
+        ).scalar()
+        if unit_price is None:
+            unit_price = TERMINAL_PRICE_FALLBACK.get(display_name)
+        if unit_price is None:
+            return 0.0
+
+        unit_price = float(unit_price)
+        if freshness == "腐烂":
+            return 0.0
+        if freshness == "瑕疵":
+            return round(unit_price * 0.5, 2)
+        return round(unit_price, 2)
+    except Exception:
+        return round(float(TERMINAL_PRICE_FALLBACK.get(display_name, 0.0)), 2)
+    finally:
+        db.close()
+
+
+def _attach_pricing(stable_result: Dict[str, Any], weight_kg: float) -> Dict[str, Any]:
+    display_name = str(stable_result.get("display_name") or stable_result.get("label") or "未识别商品")
+    freshness = str(stable_result.get("freshness") or "普通")
+    unit_price = _resolve_unit_price(display_name, freshness)
+    return {
+        **stable_result,
+        "display_name": display_name,
+        "freshness": freshness,
+        "unit_price": unit_price,
+        "total_price": round(unit_price * max(0.0, float(weight_kg)), 2),
+    }
+
+
 @router.websocket("/ws")
 async def video_feed(websocket: WebSocket):
     """
@@ -372,7 +450,7 @@ async def video_feed(websocket: WebSocket):
     1. 采集 RGB/Depth 帧；
     2. 非阻塞提取手部视觉特征和电子秤重量特征；
     3. 将 4 维视觉特征 + 2 维重量特征写入 DataAligner；
-    4. 使用 4D YOLO 识别果蔬并绘制检测框；
+    4. 使用 RGB YOLO 识别果蔬，并用 Depth 做辅助校验；
     5. 满 60 帧后，每 10 帧异步请求一次 /api/transaction/verify；
     6. 将视频、检测结果、重量和防作弊状态一起推送给前端。
     """
@@ -414,16 +492,19 @@ async def video_feed(websocket: WebSocket):
 
             # 1. 采集 Astra 相机的彩色帧和深度帧。
             color, depth = camera.get_frames()
+            display_frame = color.copy()
+            infer_frame = display_frame.copy()
 
             # 2. LSTM 多模态防作弊特征采集。
             # vision.extract_features 只做手部关键点/ROI 特征提取；
             # scale.get_features 返回 [当前重量, 重量变化量]。
             # 二者都在当前帧周期内完成，并立即送入 aligner 形成同步滑窗。
-            vision_features = vision.extract_features(color)
+            vision_features = vision.extract_features(display_frame)
             raw_weight, weight_diff = scale.get_features()
-            if camera.is_mock and not scale.connected:
+            if camera.is_mock and not scale.connected and not getattr(scale, "is_mock", False):
                 raw_weight = float(os.getenv("MOCK_WEIGHT_GRAMS", "500"))
                 weight_diff = 0.0
+            scale_has_item = _has_weighted_item(raw_weight)
             session_aligner.update(vision_features, [raw_weight, weight_diff])
 
             # 论文中的部分遮挡特征为 ROI 内关键点数量 / 21。
@@ -482,6 +563,18 @@ async def video_feed(websocket: WebSocket):
                     if current_lstm_score < runtime_config.anti_cheat_threshold:
                         current_is_secure = True
 
+                    if _should_suppress_empty_scale_prediction(current_prediction, raw_weight):
+                        suppressed_prediction = current_prediction
+                        current_prediction = "normal"
+                        current_is_secure = True
+                        current_lstm_score = 0.0
+                        current_detection_source = "lstm_suppressed"
+                        current_detection_reason = (
+                            f"Scale weight {raw_weight:.1f}g is below "
+                            f"{MIN_OBJECT_WEIGHT_GRAMS:.1f}g; suppressed "
+                            f"{suppressed_prediction}."
+                        )
+
                     # 部分遮挡还要满足 ROI 占比连续保持超过管理员配置的持续时间。
                     if (
                         current_prediction == "occlusion"
@@ -509,6 +602,18 @@ async def video_feed(websocket: WebSocket):
                 current_lstm_score = active_weight_violation.score
                 current_detection_source = "weight_guard"
                 current_detection_reason = active_weight_violation.reason
+
+            if _should_suppress_empty_scale_prediction(current_prediction, raw_weight):
+                suppressed_prediction = current_prediction
+                current_prediction = "normal"
+                current_is_secure = True
+                current_lstm_score = 0.0
+                current_detection_source = "empty_scale_guard"
+                current_detection_reason = (
+                    f"Scale weight {raw_weight:.1f}g is below "
+                    f"{MIN_OBJECT_WEIGHT_GRAMS:.1f}g; suppressed "
+                    f"{suppressed_prediction}."
+                )
 
             # 遮挡特征是连续高 ROI 占比。先抑制候选期内的 swap/lift 误分类，
             # 达到配置时长后再以最高优先级明确输出 occlusion。
@@ -557,30 +662,72 @@ async def video_feed(websocket: WebSocket):
             # 5. 释放一次协程控制权，让 FastAPI/事件循环有机会处理网络发送和断开事件。
             await asyncio.sleep(0.01)
 
-            # 6. 原有 4D YOLO 果蔬检测。
-            detections, raw_img = detector.detect(color, depth)
+            # 6. RGB YOLO 分类 + Depth 辅助校验。
+            detections, _ = detector.detect(infer_frame)
             item_analysis = analyze_detected_items(
                 detections,
                 confidence_threshold=runtime_config.min_confidence_threshold,
             )
+
+            validated_detections = []
+            depth_checks = []
+            frame_status = item_analysis["status"]
+            frame_message = item_analysis["message"]
+
+            if frame_status != "multi_item_error":
+                for detection in item_analysis["effective_detections"]:
+                    depth_check = depth_validator.validate_detection(
+                        detection,
+                        depth,
+                        rgb_shape=infer_frame.shape[:2],
+                    )
+                    enriched = {**detection, "depth_check": depth_check}
+                    depth_checks.append(depth_check)
+                    if depth_check.get("valid"):
+                        validated_detections.append(enriched)
+                        continue
+
+                    reason = str(depth_check.get("reason") or "")
+                    if reason in {
+                        "target_not_on_scale",
+                        "occlusion_detected",
+                        "invalid_depth",
+                        "depth_out_of_range",
+                    }:
+                        frame_status = reason
+                        frame_message = {
+                            "target_not_on_scale": "请将商品放置到秤面中央",
+                            "occlusion_detected": "检测到遮挡，请移开手部或遮挡物",
+                            "invalid_depth": "深度数据不可用，请检查深度相机",
+                            "depth_out_of_range": "商品距离超出有效深度范围",
+                        }.get(reason, frame_message)
+                        break
+
+            if frame_status == "normal" and not validated_detections:
+                if detections:
+                    frame_status = "low_confidence"
+                    frame_message = "识别置信度较低，请重新摆放商品"
+                else:
+                    frame_status = "no_object"
+                    frame_message = "未检测到商品"
+
             recognition = fruit_stabilizer.update(
-                item_analysis["effective_detections"],
+                validated_detections,
                 raw_weight,
                 now=monotonic(),
-                item_status=item_analysis["status"],
-                item_message=item_analysis["message"],
+                frame_status=frame_status,
+                frame_message=frame_message,
             )
 
             # 多种果蔬混放时停止计价：前端只收到空 items，不会继续按最高置信度商品计价。
             # 多个同类框则继续使用有效框，由前端按最高置信度框确定商品名称，
             # 重量仍来自电子秤总重量，相当于按同一种商品合并称重。
             pricing_items = item_analysis["effective_detections"]
-            if item_analysis["status"] == "multi_item_error":
-                pricing_items = []
+            pricing_items = []
 
-            # 7. 缓存 raw_img 原始帧。必须 copy，避免后续绘制框或数组复用影响证据视频。
-            frame_buffer.append(raw_img.copy())
-            cache_order_video_frame(raw_img)
+            # 7. 缓存浏览器显示用原始比例帧。必须 copy，避免后续绘制框或数组复用影响证据视频。
+            frame_buffer.append(display_frame.copy())
+            cache_order_video_frame(display_frame)
 
             # 8. 如果 LSTM 判定当前窗口存在作弊，触发一次后台证据留存。
             # 注意：只提交线程池任务，主循环继续推送视频，绝不等待视频写盘或数据库写入。
@@ -604,7 +751,7 @@ async def video_feed(websocket: WebSocket):
                     transaction_id,
                 )
 
-            annotated_img = _draw_detections(raw_img, detections)
+            annotated_img = _draw_detections(display_frame, detections)
             if hand_overlay_enabled:
                 annotated_img = vision.draw_debug_overlay(annotated_img)
 
@@ -613,13 +760,19 @@ async def video_feed(websocket: WebSocket):
             weight_kg = max(0.0, raw_weight / 1000.0)
             stable_result = recognition["stable_result"]
             if stable_result is not None:
-                stable_result = {
+                stable_result = _attach_pricing({
                     **stable_result,
                     "weight": weight_kg,
-                }
+                    "weight_kg": weight_kg,
+                }, weight_kg)
+                pricing_items = [stable_result]
 
             # 10. 编码当前帧为 base64 jpg，沿用原来的前端消费格式。
-            _, buffer = cv2.imencode(".jpg", annotated_img)
+            _, buffer = cv2.imencode(
+                ".jpg",
+                annotated_img,
+                [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY],
+            )
             jpg_text = base64.b64encode(buffer).decode("utf-8")
 
             # 11. 构造防作弊信令。正常时只发送 status=normal；
@@ -628,9 +781,15 @@ async def video_feed(websocket: WebSocket):
 
             message = {
                 "image": jpg_text,
+                "image_width": int(annotated_img.shape[1]),
+                "image_height": int(annotated_img.shape[0]),
                 "items": pricing_items,
                 "stable_result": stable_result,
+                "raw_detections": detections,
+                "depth_checks": depth_checks,
                 "weight": weight_kg,
+                "scale_has_item": scale_has_item,
+                "min_object_weight_grams": MIN_OBJECT_WEIGHT_GRAMS,
                 "status": security_signal["status"],
                 "recognition_status": recognition["status"],
                 "recognition_message": recognition["message"],
@@ -639,12 +798,13 @@ async def video_feed(websocket: WebSocket):
                 "recognition_average_confidence": recognition["average_confidence"],
                 "recognition_sample_count": recognition["sample_count"],
                 "inference_mode": detector.last_inference_mode,
+                "detector_mode": DETECTOR_MODE,
                 "camera_mode": camera.mode,
-                "item_status": item_analysis["status"],
-                "error_code": item_analysis["error_code"],
-                "message": item_analysis["message"],
+                "item_status": frame_status,
+                "error_code": item_analysis["error_code"] if frame_status == item_analysis["status"] else frame_status.upper(),
+                "message": frame_message or recognition["message"],
                 "pricing_mode": item_analysis["pricing_mode"],
-                "valid_detection_count": item_analysis["valid_detection_count"],
+                "valid_detection_count": len(validated_detections),
                 "detected_categories": item_analysis["detected_categories"],
                 "lstm_score": round(current_lstm_score, 3),
                 "occlusion_ratio": round(occlusion_ratio, 3),
@@ -658,9 +818,8 @@ async def video_feed(websocket: WebSocket):
             }
             if security_signal["status"] == "alert":
                 message["type"] = security_signal["type"]
-            elif item_analysis["status"] == "multi_item_error":
-                # 防作弊告警优先级更高；无防作弊告警时，顶层 status 明确返回多商品错误。
-                message["status"] = "multi_item_error"
+            elif frame_status != "normal":
+                message["status"] = frame_status
 
             await websocket.send_json(message)
 
