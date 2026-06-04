@@ -57,4 +57,9 @@ export const getTransactionVideoUrl = (transactionId, videoUrl = '') => {
   return new URL(videoUrl || fallbackUrl, new URL(apiClient.defaults.baseURL).origin).toString();
 };
 
+export const getTransactionVideoStreamUrl = (transactionId) => {
+  const streamUrl = `/api/admin/transactions/${encodeURIComponent(transactionId)}/video-stream`;
+  return new URL(streamUrl, new URL(apiClient.defaults.baseURL).origin).toString();
+};
+
 export default apiClient;

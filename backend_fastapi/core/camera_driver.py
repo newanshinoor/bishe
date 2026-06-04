@@ -81,8 +81,8 @@ class AstraCamera:
         if not self.cap.isOpened():
             raise RuntimeError(f"color camera port {color_port} cannot be opened")
 
-        requested_width = _env_int("RGB_FRAME_WIDTH", 1280)
-        requested_height = _env_int("RGB_FRAME_HEIGHT", 720)
+        requested_width = _env_int("RGB_FRAME_WIDTH", 640)
+        requested_height = _env_int("RGB_FRAME_HEIGHT", 480)
         requested_fps = _env_int("RGB_CAMERA_FPS", 30)
         requested_fourcc = _env_fourcc("RGB_CAMERA_FOURCC", "MJPG")
 
@@ -123,6 +123,16 @@ class AstraCamera:
 
         self.last_color_img = frame
         return True
+
+    def _resolve_openni_path(self, sdk_bin_path: str) -> str:
+        path = Path(sdk_bin_path).expanduser()
+        if path.is_absolute():
+            return str(path)
+        for base in (Path.cwd(), PROJECT_ROOT):
+            candidate = (base / path).resolve()
+            if candidate.exists():
+                return str(candidate)
+        return str((PROJECT_ROOT / path).resolve())
 
     def _resolve_openni_path(self, sdk_bin_path: str) -> str:
         path = Path(sdk_bin_path).expanduser()

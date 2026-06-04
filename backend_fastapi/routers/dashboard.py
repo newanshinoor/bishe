@@ -246,11 +246,13 @@ def get_advanced_monitor():
     try:
         # 1. 真实查库：今日交易额与订单数（限正常单 tag=0）
         query_sales = """
-            SELECT SUM(pay_amount) as total_sales, COUNT(transaction_id) as total_orders
-            FROM transaction 
-            WHERE DATE(creat_at) = CURDATE()
-              AND tag = 0
+            SELECT
+                SUM(pay_amount) AS total_sales,
+                COUNT(DISTINCT COALESCE(payment_order_id, transaction_id)) AS total_orders
+            FROM `transaction`
+            WHERE DATE(COALESCE(paid_at, creat_at)) = CURDATE()
               AND payment_status = 'paid'
+              AND (anti_cheat_tag = 'normal' OR tag = 0)
         """
         try:
             df_sales = pd.read_sql(query_sales, con=engine)

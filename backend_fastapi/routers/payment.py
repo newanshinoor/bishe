@@ -16,7 +16,7 @@ from core.customer_risk import (
     serialize_blacklisted_customer,
 )
 from core.database import SessionLocal
-from core.inventory_settlement import InventorySettlementError, settle_paid_order_inventory
+from core.inventory_settlement import InventorySettlementError, complete_mock_payment
 from core.payment_state import (
     get_payment_order,
     mark_payment_completed,
@@ -44,6 +44,13 @@ class ScanAuthReq(BaseModel):
 
 class PaymentCallbackReq(BaseModel):
     order_id: str
+    payment_channel: str = "mock_wechat"
+    gateway_trade_no: Optional[str] = None
+    paid_amount: Optional[float] = None
+
+
+class MockSuccessReq(BaseModel):
+    payment_no: str
     payment_channel: str = "mock_wechat"
     gateway_trade_no: Optional[str] = None
     paid_amount: Optional[float] = None
@@ -359,13 +366,9 @@ async def payment_callback(req: PaymentCallbackReq):
     真实支付平台会在用户付款完成后，由平台服务器请求这个接口；
     本项目演示时由确认页或 Postman/curl 手动调用它。
     """
-    existing_order = get_payment_order(req.order_id)
-    if not existing_order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
     db = SessionLocal()
     try:
-        settlement = settle_paid_order_inventory(db, payment_order_id=req.order_id)
+        completion = complete_mock_payment(db, payment_no=req.order_id)
         db.commit()
     except InventorySettlementError as exc:
         db.rollback()
@@ -383,6 +386,7 @@ async def payment_callback(req: PaymentCallbackReq):
         gateway_trade_no=gateway_trade_no,
         paid_amount=req.paid_amount,
     )
+    paid_at = order["paid_at"] if order else None
 
     await payment_manager.notify(
         req.order_id,
@@ -391,8 +395,9 @@ async def payment_callback(req: PaymentCallbackReq):
             "order_id": req.order_id,
             "status": "completed",
             "redirect": f"/payment-success?order_id={req.order_id}",
-            "paid_at": order["paid_at"],
-            "inventory_settlement": settlement,
+            "paid_at": paid_at,
+            "inventory_settlement": completion.get("settlement"),
+            "idempotent": completion.get("idempotent", False),
         },
     )
 
@@ -400,6 +405,58 @@ async def payment_callback(req: PaymentCallbackReq):
         "status": "success",
         "order_id": req.order_id,
         "payment_status": "completed",
-        "gateway_trade_no": order["gateway_trade_no"],
-        "inventory_settlement": settlement,
+        "gateway_trade_no": order["gateway_trade_no"] if order else gateway_trade_no,
+        "inventory_settlement": completion.get("settlement"),
+        "idempotent": completion.get("idempotent", False),
+    }
+
+
+@router.post("/mock-success")
+async def mock_payment_success(req: MockSuccessReq):
+    """Complete the simulated payment after the frontend payment page countdown."""
+    db = SessionLocal()
+    try:
+        completion = complete_mock_payment(db, payment_no=req.payment_no)
+        db.commit()
+    except InventorySettlementError as exc:
+        db.rollback()
+        return {
+            "status": "failed",
+            "message": str(exc),
+            "code": "PAYMENT_COMPLETION_FAILED",
+            "payment_no": req.payment_no,
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    gateway_trade_no = req.gateway_trade_no or f"MOCK_{uuid.uuid4().hex[:16].upper()}"
+    order = mark_payment_completed(
+        order_id=req.payment_no,
+        payment_channel=req.payment_channel,
+        gateway_trade_no=gateway_trade_no,
+        paid_amount=req.paid_amount,
+    )
+    paid_at = order["paid_at"] if order else None
+
+    await payment_manager.notify(
+        req.payment_no,
+        {
+            "event": "payment_success",
+            "order_id": req.payment_no,
+            "status": "completed",
+            "redirect": f"/payment-success?order_id={req.payment_no}",
+            "paid_at": paid_at,
+            "inventory_settlement": completion.get("settlement"),
+            "idempotent": completion.get("idempotent", False),
+        },
+    )
+
+    return {
+        **completion,
+        "order_id": req.payment_no,
+        "payment_status": "completed",
+        "gateway_trade_no": order["gateway_trade_no"] if order else gateway_trade_no,
     }

@@ -350,20 +350,28 @@
       </div>
     </main>
 
-    <el-dialog v-model="showOrderVideoDialog" title="支付前 8 秒订单视频" width="760px" @closed="closeOrderVideo">
+    <el-dialog v-model="showOrderVideoDialog" :title="'\u652f\u4ed8\u524d 8 \u79d2\u8ba2\u5355\u89c6\u9891'" width="760px" @closed="closeOrderVideo">
       <video
-        v-if="currentOrderVideoUrl"
+        v-if="currentOrderVideoUrl && !currentOrderVideoFallbackUrl"
         ref="orderVideoRef"
         class="order-video-player"
         :src="currentOrderVideoUrl"
         controls
         preload="metadata"
         @loadedmetadata="orderVideoError = ''"
-        @error="orderVideoError = '视频加载失败，请确认视频文件仍然存在。'"
+        @error="handleOrderVideoError"
       ></video>
+      <img
+        v-else-if="currentOrderVideoFallbackUrl"
+        class="order-video-player"
+        :src="currentOrderVideoFallbackUrl"
+        :alt="'\u652f\u4ed8\u524d 8 \u79d2\u8ba2\u5355\u89c6\u9891'"
+        @load="orderVideoError = '\u5f53\u524d\u6d4f\u89c8\u5668\u4e0d\u652f\u6301\u539f\u89c6\u9891\u7f16\u7801\uff0c\u5df2\u5207\u6362\u4e3a\u517c\u5bb9\u64ad\u653e\u6d41\u3002'"
+        @error="orderVideoError = '\u89c6\u9891\u52a0\u8f7d\u5931\u8d25\uff0c\u8bf7\u786e\u8ba4\u89c6\u9891\u6587\u4ef6\u4ecd\u7136\u5b58\u5728\u3002'"
+      />
       <p v-if="orderVideoError" class="evidence-error">{{ orderVideoError }}</p>
       <template #footer>
-        <button class="btn-cancel" @click="showOrderVideoDialog = false">关闭</button>
+        <button class="btn-cancel" @click="showOrderVideoDialog = false">{{ '\u5173\u95ed' }}</button>
       </template>
     </el-dialog>
 
@@ -507,6 +515,7 @@ import 'element-plus/dist/index.css';
 import api, {
   getCustomerBlacklist,
   getAdminTransactions,
+  getTransactionVideoStreamUrl,
   liftCustomerBlacklist,
   getTransactionVideoUrl,
   updateTransactionManualCheck
@@ -545,6 +554,8 @@ const orderPagination = ref({ page: 1, page_size: 10, total: 0 });
 const orderPageCount = computed(() => Math.max(1, Math.ceil(orderPagination.value.total / orderPagination.value.page_size)));
 const showOrderVideoDialog = ref(false);
 const currentOrderVideoUrl = ref('');
+const currentOrderVideoFallbackUrl = ref('');
+const currentOrderVideoTransactionId = ref('');
 const orderVideoError = ref('');
 const orderVideoRef = ref(null);
 const showAbnormalCheckDialog = ref(false);
@@ -913,12 +924,23 @@ const changeOrderPage = (page) => {
 const handleOrderPageSizeChange = () => fetchOrders({ resetPage: true });
 const openOrderVideo = (order) => {
   if (!order.payment_before_video_url) {
-    ElMessage.warning('该订单暂无视频');
+    ElMessage.warning('\u8be5\u8ba2\u5355\u6682\u65e0\u89c6\u9891');
     return;
   }
   orderVideoError.value = '';
-  currentOrderVideoUrl.value = `${getTransactionVideoUrl(order.transaction_id, order.payment_before_video_url)}?t=${Date.now()}`;
+  currentOrderVideoFallbackUrl.value = '';
+  currentOrderVideoTransactionId.value = order.transaction_id || '';
+  currentOrderVideoUrl.value = getTransactionVideoUrl(order.transaction_id, order.payment_before_video_url) + '?t=' + Date.now();
   showOrderVideoDialog.value = true;
+};
+const handleOrderVideoError = () => {
+  const orderId = currentOrderVideoTransactionId.value;
+  if (!orderId) {
+    orderVideoError.value = '\u89c6\u9891\u52a0\u8f7d\u5931\u8d25\uff0c\u8bf7\u786e\u8ba4\u89c6\u9891\u6587\u4ef6\u4ecd\u7136\u5b58\u5728\u3002';
+    return;
+  }
+  orderVideoError.value = '\u5f53\u524d\u6d4f\u89c8\u5668\u4e0d\u652f\u6301\u539f\u89c6\u9891\u7f16\u7801\uff0c\u6b63\u5728\u5207\u6362\u517c\u5bb9\u64ad\u653e\u6d41\u3002';
+  currentOrderVideoFallbackUrl.value = getTransactionVideoStreamUrl(orderId) + '?t=' + Date.now();
 };
 const closeOrderVideo = () => {
   if (orderVideoRef.value) {
@@ -927,6 +949,8 @@ const closeOrderVideo = () => {
     orderVideoRef.value.load();
   }
   currentOrderVideoUrl.value = '';
+  currentOrderVideoFallbackUrl.value = '';
+  currentOrderVideoTransactionId.value = '';
   orderVideoError.value = '';
 };
 const markOrderNormal = async (order) => {

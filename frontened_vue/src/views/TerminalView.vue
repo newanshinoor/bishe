@@ -45,7 +45,7 @@
             </div>
             <p class="calc-total">总计: <span>¥{{ currentDetected.totalPrice.toFixed(2) }}</span></p>
           </div>
-          <button class="btn btn-primary add-btn" @click="addToCart" :disabled="!weightStable || currentDetected.weight <= 0">确认添加</button>
+          <button class="btn btn-primary add-btn" @click="addToCart" :disabled="currentDetected.weight <= 0">确认添加</button>
         </div>
         <div class="current-item-panel empty" v-else-if="isRecognizing && !currentDetected">
           <p>{{ recognitionHint }}</p>
@@ -257,8 +257,6 @@ const hasMultiItemError = ref(false);
 const multiItemMessage = ref('');
 const recognitionStatus = ref('waiting');
 const recognitionHint = ref('请将果蔬放置在摄像头下与秤台上...');
-const weightStable = ref(false);
-
 const roiBoxStyle = computed(() => {
   videoGeometryVersion.value;
   const activeBox = roiDraftBox.value || roiBox.value;
@@ -275,14 +273,15 @@ const roiBoxStyle = computed(() => {
 
 // === 新增：支付页状态控制 ===
 const showPaymentPage = ref(route.meta.paymentPreview === true);
-const currentOrderId = ref('');
+const currentOrderId = ref(localStorage.getItem('pending_payment_order_id') || '');
 const qrCodeUrl = ref('');
-const paymentStatus = ref('pending'); // pending, success
-const paymentMethod = ref('wechat');  // 'wechat' or 'alipay'
+const paymentStatus = ref('pending'); // pending, success, failed
+const paymentMethod = ref(localStorage.getItem('pending_payment_channel') === 'mock_alipay' ? 'alipay' : 'wechat');
 const mockCustomerId = ref('CUSTOMER_001');
-const timeLeft = ref(119);
+const timeLeft = ref(5);
 let pollingInterval = null;
 let countdownInterval = null;
+let mockPaymentTimer = null;
 let paymentWs = null;
 
 watch(
@@ -323,8 +322,6 @@ const toggleRecognition = async () => {
 
       let realWeight = Math.max(0, data.weight || 0);
       recognitionStatus.value = data.recognition_status || 'waiting';
-      weightStable.value = Boolean(data.weight_stable);
-
       if (recognitionStatus.value === 'multi_item_error' || data.status === 'multi_item_error') {
         hasMultiItemError.value = true;
         multiItemMessage.value = data.message || '检测到多种果蔬，请一次仅放置一种商品称重';
@@ -346,7 +343,6 @@ const toggleRecognition = async () => {
         showTerminalCheatAlert.value = true;
         isRecognizing.value = false;
         currentDetected.value = null;
-        weightStable.value = false;
         if (ws === socket) {
           ws = null;
         }
@@ -373,27 +369,22 @@ const toggleRecognition = async () => {
     multiItemMessage.value = '';
     recognitionStatus.value = 'waiting';
     recognitionHint.value = '请将果蔬放置在摄像头下与秤台上...';
-    weightStable.value = false;
   }
 };
 
 const getRecognitionHint = (data) => {
   const status = data.recognition_status || data.status || data.item_status;
   const hints = {
-    waiting_weight: '正在稳定称重，请稍候',
-    waiting_detection: '正在稳定识别，请保持商品不动',
-    waiting: '正在稳定识别，请保持商品不动',
-    low_confidence: '识别置信度较低，请重新摆放商品',
-    multi_item_error: '检测到多种果蔬，请一次仅放置一种商品称重',
-    occlusion_detected: '检测到遮挡，请移开手部或遮挡物',
-    target_not_on_scale: '请将商品放置到秤面中央',
-    invalid_depth: '深度数据不可用，请检查深度相机',
-    depth_out_of_range: '商品距离超出有效深度范围',
-    no_object: '未检测到商品'
+    low_confidence: '\u8bc6\u522b\u7f6e\u4fe1\u5ea6\u4f4e\u4e8e\u540e\u53f0 YOLO \u9608\u503c\uff0c\u8bf7\u91cd\u65b0\u6446\u653e\u5546\u54c1',
+    multi_item_error: '\u68c0\u6d4b\u5230\u591a\u79cd\u679c\u852c\uff0c\u8bf7\u4e00\u6b21\u4ec5\u653e\u7f6e\u4e00\u79cd\u5546\u54c1\u79f0\u91cd',
+    occlusion_detected: '\u68c0\u6d4b\u5230\u906e\u6321\uff0c\u8bf7\u79fb\u5f00\u624b\u90e8\u6216\u906e\u6321\u7269',
+    target_not_on_scale: '\u8bf7\u5c06\u5546\u54c1\u653e\u7f6e\u5230\u79e4\u9762\u4e2d\u592e',
+    invalid_depth: '\u6df1\u5ea6\u6570\u636e\u4e0d\u53ef\u7528\uff0c\u8bf7\u68c0\u67e5\u6df1\u5ea6\u76f8\u673a',
+    depth_out_of_range: '\u5546\u54c1\u8ddd\u79bb\u8d85\u51fa\u6709\u6548\u6df1\u5ea6\u8303\u56f4',
+    no_object: '\u672a\u68c0\u6d4b\u5230\u5546\u54c1'
   };
-  return hints[status] || data.recognition_message || data.message || '正在稳定识别，请保持商品不动';
+  return hints[status] || data.recognition_message || data.message || '\u8bf7\u5c06\u679c\u852c\u653e\u7f6e\u5728\u6444\u50cf\u5934\u4e0b\u4e0e\u79e4\u53f0\u4e0a...';
 };
-
 const parseStableResult = (item, currentWeight) => {
   if (!item) {
     currentDetected.value = null;
@@ -419,11 +410,6 @@ const parseStableResult = (item, currentWeight) => {
 const addToCart = () => {
   if (hasMultiItemError.value) {
     alert('检测到多种果蔬，请一次仅放置一种商品称重');
-    return;
-  }
-
-  if (!weightStable.value) {
-    alert('正在稳定称重，请稍候');
     return;
   }
 
@@ -505,17 +491,19 @@ const handleCheckout = async () => {
       })
     });
     const resData = await response.json();
-    if (!response.ok) throw new Error(resData.detail || '订单创建失败');
+    if (!response.ok) throw new Error(resData.detail || '\u8ba2\u5355\u521b\u5efa\u5931\u8d25');
 
-    // 3. 切换为全屏支付界面
     currentOrderId.value = resData.order_id;
     qrCodeUrl.value = resData.qr_code_url;
     paymentStatus.value = 'pending';
-    showPaymentPage.value = true; // 隐藏收银台，显示支付页
+    localStorage.setItem('pending_payment_order_id', resData.order_id);
+    localStorage.setItem('pending_payment_amount', String(resData.total_amount || cartTotalPrice.value));
+    localStorage.setItem('pending_payment_channel', paymentMethod.value === 'alipay' ? 'mock_alipay' : 'mock_wechat');
+    showPaymentPage.value = true;
     await router.push('/payment');
 
-    // 4. 开启倒计时、WebSocket 通知和轮询兜底
     startCountdown();
+    startMockPaymentSuccessTimer();
     startPaymentNotify();
     startPollingStatus();
   } catch (error) {
@@ -525,19 +513,49 @@ const handleCheckout = async () => {
 };
 
 const startCountdown = () => {
-  timeLeft.value = 119;
+  timeLeft.value = 5;
   if (countdownInterval) clearInterval(countdownInterval);
   countdownInterval = setInterval(() => {
     if (timeLeft.value > 0) {
       timeLeft.value--;
     } else {
       clearInterval(countdownInterval);
-      if (paymentStatus.value === 'pending') {
-        alert("支付超时，请重新结算！");
-        cancelPayment();
-      }
     }
   }, 1000);
+};
+
+const startMockPaymentSuccessTimer = () => {
+  if (mockPaymentTimer) clearTimeout(mockPaymentTimer);
+  mockPaymentTimer = setTimeout(() => {
+    submitMockPaymentSuccess();
+  }, 5000);
+};
+
+const submitMockPaymentSuccess = async () => {
+  if (paymentStatus.value !== 'pending' || !showPaymentPage.value || !currentOrderId.value) return;
+
+  try {
+    const response = await fetch('http://localhost:8000/api/payment/mock-success', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        payment_no: currentOrderId.value,
+        payment_channel: paymentMethod.value === 'alipay' ? 'mock_alipay' : 'mock_wechat',
+        paid_amount: Number(cartTotalPrice.value) || Number(localStorage.getItem('pending_payment_amount') || 0)
+      })
+    });
+    const data = await response.json();
+    if (response.ok && data.status === 'success') {
+      paymentSuccess();
+      return;
+    }
+
+    paymentStatus.value = 'failed';
+    alert(data.message || data.detail || '\u652f\u4ed8\u5931\u8d25\uff0c\u8bf7\u91cd\u65b0\u7ed3\u7b97');
+  } catch (error) {
+    paymentStatus.value = 'failed';
+    alert('\u652f\u4ed8\u8bf7\u6c42\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u540e\u7aef\u670d\u52a1\u540e\u91cd\u8bd5');
+  }
 };
 
 const getDisplayedImageRect = () => {
@@ -711,7 +729,7 @@ const startPaymentNotify = () => {
 const startPollingStatus = () => {
   if (pollingInterval) clearInterval(pollingInterval);
   pollingInterval = setInterval(async () => {
-    if (paymentStatus.value === 'success' || !showPaymentPage.value) return;
+    if (paymentStatus.value !== 'pending' || !showPaymentPage.value) return;
 
     try {
       const response = await fetch(`http://localhost:8000/api/transaction/status/${currentOrderId.value}`);
@@ -729,13 +747,19 @@ const startPollingStatus = () => {
 const paymentSuccess = () => {
   clearInterval(pollingInterval);
   clearInterval(countdownInterval);
+  if (mockPaymentTimer) {
+    clearTimeout(mockPaymentTimer);
+    mockPaymentTimer = null;
+  }
   if (paymentWs) {
     paymentWs.close();
     paymentWs = null;
   }
   paymentStatus.value = 'success';
+  localStorage.removeItem('pending_payment_order_id');
+  localStorage.removeItem('pending_payment_amount');
+  localStorage.removeItem('pending_payment_channel');
 
-  // 延迟 2.5 秒后自动返回收银台并清空购物车
   setTimeout(() => {
     returnToTerminal();
     cartItems.value = [];
@@ -752,10 +776,17 @@ const returnToTerminal = () => {
 const cancelPayment = () => {
   if (pollingInterval) clearInterval(pollingInterval);
   if (countdownInterval) clearInterval(countdownInterval);
+  if (mockPaymentTimer) {
+    clearTimeout(mockPaymentTimer);
+    mockPaymentTimer = null;
+  }
   if (paymentWs) {
     paymentWs.close();
     paymentWs = null;
   }
+  localStorage.removeItem('pending_payment_order_id');
+  localStorage.removeItem('pending_payment_amount');
+  localStorage.removeItem('pending_payment_channel');
   returnToTerminal();
 };
 
@@ -764,6 +795,12 @@ onMounted(() => {
   window.addEventListener('keydown', handleKeyDown);
   window.addEventListener('resize', syncVideoGeometry);
   loadRoi();
+  if (showPaymentPage.value && currentOrderId.value) {
+    startCountdown();
+    startMockPaymentSuccessTimer();
+    startPaymentNotify();
+    startPollingStatus();
+  }
 });
 
 onBeforeUnmount(() => {
@@ -773,6 +810,7 @@ onBeforeUnmount(() => {
   if (paymentWs) paymentWs.close();
   if (pollingInterval) clearInterval(pollingInterval);
   if (countdownInterval) clearInterval(countdownInterval);
+  if (mockPaymentTimer) clearTimeout(mockPaymentTimer);
 });
 </script>
 

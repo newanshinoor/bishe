@@ -31,7 +31,6 @@ from core.camera_driver import AstraCamera
 from core.depth_validator import DepthValidator
 from core.detection_analysis import analyze_detected_items
 from core.detector_rgb import RGBFruitDetector
-from core.fruit_detection_stabilizer import FruitDetectionStabilizer
 from core.alarm_log import AlarmLog
 from core.database import SessionLocal
 from core.order_video import cache_order_video_frame
@@ -370,6 +369,99 @@ def _draw_detections(raw_img, detections: list[Dict[str, Any]]):
     return annotated_img
 
 
+def _detection_center_in_roi(
+    detection: Dict[str, Any],
+    roi: list[float] | tuple[float, float, float, float] | None,
+    image_shape: tuple[int, int],
+) -> bool:
+    if not roi or len(roi) != 4:
+        return True
+
+    box = detection.get("bbox") or detection.get("box")
+    if not box or len(box) != 4:
+        return False
+
+    height, width = image_shape[:2]
+    if width <= 0 or height <= 0:
+        return False
+
+    x1, y1, x2, y2 = [float(value) for value in box]
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    rx1, ry1, rx2, ry2 = [float(value) for value in roi]
+
+    if max(rx1, ry1, rx2, ry2) <= 1.0:
+        rx1, rx2 = rx1 * width, rx2 * width
+        ry1, ry2 = ry1 * height, ry2 * height
+
+    return rx1 <= cx <= rx2 and ry1 <= cy <= ry2
+
+
+def _best_roi_detection(
+    detections: list[Dict[str, Any]],
+    roi: list[float] | tuple[float, float, float, float] | None,
+    image_shape: tuple[int, int],
+) -> Optional[Dict[str, Any]]:
+    roi_detections = [
+        detection
+        for detection in detections
+        if _detection_center_in_roi(detection, roi, image_shape)
+    ]
+    if not roi_detections:
+        return None
+    return max(roi_detections, key=lambda item: float(item.get("conf", 0.0)))
+
+
+def _filter_roi_detections(
+    detections: list[Dict[str, Any]],
+    roi: list[float] | tuple[float, float, float, float] | None,
+    image_shape: tuple[int, int],
+) -> list[Dict[str, Any]]:
+    return [
+        detection
+        for detection in detections
+        if _detection_center_in_roi(detection, roi, image_shape)
+    ]
+
+
+def _build_recognition_result(
+    frame_status: str,
+    frame_message: str,
+    validated_detections: list[Dict[str, Any]],
+    raw_weight: float,
+) -> Dict[str, Any]:
+    stable_statuses = {"normal", "same_category_multiple"}
+    if frame_status in stable_statuses and validated_detections:
+        stable = max(
+            validated_detections,
+            key=lambda item: float(item.get("confidence", item.get("conf", 0.0))),
+        ).copy()
+        confidence = float(stable.get("confidence", stable.get("conf", 0.0)))
+        stable["status"] = "stable"
+        stable["confidence"] = round(confidence, 4)
+        stable["conf"] = round(confidence, 4)
+        stable["vote_ratio"] = 1.0
+        stable["weight"] = round(float(raw_weight), 2)
+        stable["weight_grams"] = round(float(raw_weight), 2)
+        return {
+            "status": "stable",
+            "stable_result": stable,
+            "message": frame_message or "识别结果已确认",
+            "vote_ratio": 1.0,
+            "average_confidence": round(confidence, 4),
+            "sample_count": len(validated_detections),
+        }
+
+    return {
+        "status": frame_status,
+        "stable_result": None,
+        "message": frame_message,
+        "vote_ratio": 0.0,
+        "average_confidence": 0.0,
+        "sample_count": 0,
+    }
+
+
 def _build_security_signal(is_secure: bool, prediction: str) -> Dict[str, str]:
     """
     构造发送给前端的防作弊信令字段。
@@ -459,7 +551,6 @@ async def video_feed(websocket: WebSocket):
     # 每次重新点击“开始识别”都会建立新的 WebSocket。
     # 对齐窗口必须属于当前连接，不能复用上一次作弊发生时残留的 60 帧。
     session_aligner = DataAligner(window_size=ALIGN_WINDOW_SIZE)
-    fruit_stabilizer = FruitDetectionStabilizer()
     weight_guard = RealtimeWeightGuard()
     occlusion_guard = RealtimeOcclusionGuard(
         ratio_threshold=OCCLUSION_RATIO_THRESHOLD,
@@ -664,8 +755,18 @@ async def video_feed(websocket: WebSocket):
 
             # 6. RGB YOLO 分类 + Depth 辅助校验。
             detections, _ = detector.detect(infer_frame)
-            item_analysis = analyze_detected_items(
+            best_roi_detection = _best_roi_detection(
                 detections,
+                vision.roi,
+                infer_frame.shape[:2],
+            )
+            roi_detections = _filter_roi_detections(
+                detections,
+                vision.roi,
+                infer_frame.shape[:2],
+            )
+            item_analysis = analyze_detected_items(
+                roi_detections,
                 confidence_threshold=runtime_config.min_confidence_threshold,
             )
 
@@ -691,7 +792,7 @@ async def video_feed(websocket: WebSocket):
                     if reason in {
                         "target_not_on_scale",
                         "occlusion_detected",
-                        "invalid_depth",
+                        # "invalid_depth",
                         "depth_out_of_range",
                     }:
                         frame_status = reason
@@ -702,21 +803,36 @@ async def video_feed(websocket: WebSocket):
                             "depth_out_of_range": "商品距离超出有效深度范围",
                         }.get(reason, frame_message)
                         break
+                    if reason == "invalid_depth":
+                        validated_detections.append({
+                            **detection,
+                            "depth_check": {
+                                **depth_check,
+                                "valid": True,
+                                "reason": "depth_unavailable_passthrough",
+                            },
+                        })
 
             if frame_status == "normal" and not validated_detections:
-                if detections:
+                if (
+                    best_roi_detection is not None
+                    and float(best_roi_detection.get("conf", 0.0)) < runtime_config.min_confidence_threshold
+                ):
                     frame_status = "low_confidence"
-                    frame_message = "识别置信度较低，请重新摆放商品"
+                    frame_message = (
+                        f"ROI 区域内果蔬识别置信度 "
+                        f"{float(best_roi_detection.get('conf', 0.0)):.2f} "
+                        f"低于后台 YOLO 阈值 {runtime_config.min_confidence_threshold:.2f}"
+                    )
                 else:
                     frame_status = "no_object"
                     frame_message = "未检测到商品"
 
-            recognition = fruit_stabilizer.update(
+            recognition = _build_recognition_result(
+                frame_status,
+                frame_message,
                 validated_detections,
                 raw_weight,
-                now=monotonic(),
-                frame_status=frame_status,
-                frame_message=frame_message,
             )
 
             # 多种果蔬混放时停止计价：前端只收到空 items，不会继续按最高置信度商品计价。
@@ -793,7 +909,6 @@ async def video_feed(websocket: WebSocket):
                 "status": security_signal["status"],
                 "recognition_status": recognition["status"],
                 "recognition_message": recognition["message"],
-                "weight_stable": recognition["weight_stable"],
                 "recognition_vote_ratio": recognition["vote_ratio"],
                 "recognition_average_confidence": recognition["average_confidence"],
                 "recognition_sample_count": recognition["sample_count"],
@@ -830,6 +945,5 @@ async def video_feed(websocket: WebSocket):
     finally:
         # 显式释放当前连接的历史帧，重新开始识别时必须重新采样完整窗口。
         session_aligner.reset()
-        fruit_stabilizer.reset()
         weight_guard.reset()
         occlusion_guard.reset()
