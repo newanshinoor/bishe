@@ -358,7 +358,7 @@
         :src="currentOrderVideoUrl"
         controls
         preload="metadata"
-        @loadedmetadata="orderVideoError = ''"
+        @loadedmetadata="handleOrderVideoLoadedMetadata"
         @error="handleOrderVideoError"
       ></video>
       <img
@@ -396,9 +396,15 @@
           </label>
 
           <label class="config-field">
-            <span>YOLO 有效框置信度阈值</span>
+            <span>识别有效框置信度阈值</span>
             <input v-model.number="antiCheatConfig.min_confidence_threshold" type="number" min="0" max="1" step="0.01" />
             <small>范围 0 到 1。低于该值的目标不参与多商品判断。</small>
+          </label>
+
+          <label class="config-field">
+            <span>最大有效深度距离（mm）</span>
+            <input v-model.number="antiCheatConfig.max_object_depth_mm" type="number" min="300" max="3000" step="10" />
+            <small>默认 1800mm。开启前台深度辅助时，超过该距离的目标不参与识别和计价。</small>
           </label>
         </div>
 
@@ -581,7 +587,8 @@ let alarmPollingTimer = null;
 const antiCheatConfig = ref({
   anti_cheat_threshold: 0.85,
   occlusion_duration_threshold: 5.0,
-  min_confidence_threshold: 0.60
+  min_confidence_threshold: 0.60,
+  max_object_depth_mm: 1800
 });
 const configError = ref('');
 const configSuccess = ref('');
@@ -630,7 +637,10 @@ const validateAntiCheatConfig = () => {
     return '遮挡持续时间阈值必须大于 0 秒。';
   }
   if (config.min_confidence_threshold < 0 || config.min_confidence_threshold > 1) {
-    return 'YOLO 有效框置信度阈值必须在 0 到 1 之间。';
+    return '识别有效框置信度阈值必须在 0 到 1 之间。';
+  }
+  if (config.max_object_depth_mm < 300 || config.max_object_depth_mm > 3000) {
+    return '最大有效深度距离必须在 300 到 3000 mm 之间。';
   }
   return '';
 };
@@ -640,7 +650,7 @@ const fetchAntiCheatConfig = async () => {
   try {
     const res = await api.get('/admin/config/anti-cheat');
     if (res.data.status === 'success') {
-      antiCheatConfig.value = { ...res.data.data };
+      antiCheatConfig.value = { ...antiCheatConfig.value, ...res.data.data };
     }
   } catch (error) {
     configError.value = error.response?.data?.detail || '读取防作弊配置失败，请确认后端服务正常运行。';
@@ -655,7 +665,7 @@ const saveAntiCheatConfig = async () => {
   configSaving.value = true;
   try {
     const res = await api.put('/admin/config/anti-cheat', antiCheatConfig.value);
-    antiCheatConfig.value = { ...res.data.data };
+    antiCheatConfig.value = { ...antiCheatConfig.value, ...res.data.data };
     configSuccess.value = res.data.message || '防作弊阈值已保存并实时生效。';
   } catch (error) {
     const detail = error.response?.data?.detail;
@@ -941,6 +951,33 @@ const handleOrderVideoError = () => {
   }
   orderVideoError.value = '\u5f53\u524d\u6d4f\u89c8\u5668\u4e0d\u652f\u6301\u539f\u89c6\u9891\u7f16\u7801\uff0c\u6b63\u5728\u5207\u6362\u517c\u5bb9\u64ad\u653e\u6d41\u3002';
   currentOrderVideoFallbackUrl.value = getTransactionVideoStreamUrl(orderId) + '?t=' + Date.now();
+};
+const handleOrderVideoLoadedMetadata = () => {
+  const video = orderVideoRef.value;
+  if (!video) return;
+
+  video.defaultPlaybackRate = 1.0;
+  video.playbackRate = 1.0;
+  orderVideoError.value = '';
+
+  const duration = Number(video.duration || 0);
+  console.info('[order-video]', {
+    transaction_id: currentOrderVideoTransactionId.value,
+    duration,
+    playbackRate: video.playbackRate,
+    url: currentOrderVideoUrl.value
+  });
+  if (duration > 0 && duration < 7) {
+    console.warn('订单视频实际时长不足 8 秒，请检查后端帧缓存和编码 FPS', {
+      transaction_id: currentOrderVideoTransactionId.value,
+      duration,
+      url: currentOrderVideoUrl.value
+    });
+    if (currentOrderVideoTransactionId.value) {
+      orderVideoError.value = '订单视频元数据时长不足 8 秒，已切换为按 8 秒节奏播放的兼容流。';
+      currentOrderVideoFallbackUrl.value = getTransactionVideoStreamUrl(currentOrderVideoTransactionId.value) + '?t=' + Date.now();
+    }
+  }
 };
 const closeOrderVideo = () => {
   if (orderVideoRef.value) {

@@ -13,8 +13,10 @@ from time import monotonic
 from typing import Any, Deque, Dict, Optional
 
 import cv2
+import numpy as np
 import requests
 from fastapi import APIRouter, WebSocket
+from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel
 from sqlalchemy import text
 
@@ -28,12 +30,18 @@ for path in (BASE_DIR, PROJECT_ROOT):
         sys.path.append(path)
 
 from core.camera_driver import AstraCamera
+from core.color_template_detector import ColorTemplateFruitDetector
 from core.depth_validator import DepthValidator
 from core.detection_analysis import analyze_detected_items
-from core.detector_rgb import RGBFruitDetector
 from core.alarm_log import AlarmLog
 from core.database import SessionLocal
-from core.order_video import cache_order_video_frame
+from core.order_video import (
+    OrderVideoFrame,
+    cache_order_video_frame,
+    inspect_video_file,
+    resample_timestamped_frames,
+    write_video_file,
+)
 from core.realtime_anti_cheat import RealtimeOcclusionGuard, RealtimeWeightGuard
 from core.scale_driver import RealTimeScale
 from core.system_config import get_runtime_config
@@ -51,13 +59,20 @@ class RoiUpdateReq(BaseModel):
 class HandOverlayReq(BaseModel):
     enabled: bool
 
+
+class ScaleTareReq(BaseModel):
+    force: bool = False
+
 # =========================
 # 全局配置
 # =========================
 
 # BASE_DIR 指向 backend_fastapi，方便拼接模型、接口等项目内路径。
 MODEL_PATH = os.path.join(BASE_DIR, "routers", "weights", "best.pt")
-DETECTOR_MODE = os.getenv("DETECTOR_MODE", "rgb_depth_aux").strip().lower()
+DETECTOR_MODE = os.getenv("DETECTOR_MODE", "color_template_depth").strip().lower()
+if DETECTOR_MODE != "color_template_depth":
+    print(f"Unsupported DETECTOR_MODE={DETECTOR_MODE}; force using color_template_depth")
+    DETECTOR_MODE = "color_template_depth"
 
 try:
     STREAM_JPEG_QUALITY = max(1, min(100, int(os.getenv("STREAM_JPEG_QUALITY", "90"))))
@@ -80,8 +95,8 @@ VERIFY_INTERVAL_FRAMES = 10
 # 论文要求保存“异常发生前 6 秒”的视频片段。
 # 摄像头实际运行约 10-15 FPS，这里按 15 FPS 估算，缓存 90 帧，约等于最近 6 秒。
 FRAME_CACHE_SECONDS = 6
-FRAME_CACHE_FPS_ESTIMATE = 15
-FRAME_BUFFER_MAXLEN = FRAME_CACHE_SECONDS * FRAME_CACHE_FPS_ESTIMATE
+FRAME_CACHE_TARGET_FPS = 15
+FRAME_BUFFER_MAXLEN = FRAME_CACHE_SECONDS * 30
 
 # 告警防抖冷却时间。一次作弊往往会持续多帧，冷却期可避免连续写盘拖慢视频流。
 ALARM_COOLDOWN_SECONDS = 10.0
@@ -99,8 +114,13 @@ WEIGHT_GUARD_ALERT_SECONDS = 2.0
 # Suppress swap/lift when the scale is effectively empty. A hand-only frame can
 # look like a swap sequence to the LSTM, but transaction anti-cheat requires a
 # real weighted item on the scale.
-MIN_OBJECT_WEIGHT_GRAMS = float(os.getenv("MIN_OBJECT_WEIGHT_GRAMS", "30"))
+MIN_OBJECT_WEIGHT_GRAMS = float(os.getenv("MIN_OBJECT_WEIGHT_GRAMS", "5"))
 WEIGHT_REQUIRED_LSTM_PREDICTIONS = {"swap", "lift"}
+NORMAL_WEIGHT_JITTER_GRAMS = float(os.getenv("ANTI_CHEAT_NORMAL_WEIGHT_JITTER_GRAMS", "10"))
+NORMAL_WEIGHT_JITTER_RATIO = float(os.getenv("ANTI_CHEAT_NORMAL_WEIGHT_JITTER_RATIO", "0.08"))
+ANTI_CHEAT_SIGNIFICANT_WEIGHT_GRAMS = float(os.getenv("ANTI_CHEAT_SIGNIFICANT_WEIGHT_GRAMS", "25"))
+ANTI_CHEAT_SIGNIFICANT_WEIGHT_RATIO = float(os.getenv("ANTI_CHEAT_SIGNIFICANT_WEIGHT_RATIO", "0.25"))
+LSTM_CONFIRM_WINDOWS = max(1, int(os.getenv("ANTI_CHEAT_LSTM_CONFIRM_WINDOWS", "1")))
 
 # HTTP 请求必须放到线程池中执行，避免 requests.post 阻塞事件循环，
 # 从而保证 WebSocket 视频流和重量数据持续推送。
@@ -115,9 +135,9 @@ ALARM_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="alarm-evi
 # 全局硬件与算法模块初始化
 # =========================
 
-# 摄像头、RGB YOLO 检测器、Depth 校验器、电子秤全局初始化。
+# 摄像头、颜色模板检测器、Depth 校验器、电子秤全局初始化。
 camera = AstraCamera()
-detector = RGBFruitDetector()
+detector = ColorTemplateFruitDetector()
 depth_validator = DepthValidator()
 scale = RealTimeScale()
 
@@ -163,6 +183,28 @@ def update_hand_overlay(req: HandOverlayReq):
     return {"status": "success", "enabled": hand_overlay_enabled}
 
 
+@router.get("/scale-tare")
+def get_scale_tare_state():
+    if hasattr(scale, "get_tare_debug_state"):
+        return {"status": "success", **scale.get_tare_debug_state()}
+    return {
+        "status": "success",
+        "scale_tare_state": "unsupported",
+        "scale_auto_tare_enabled": False,
+        "scale_zero_protected": True,
+    }
+
+
+@router.post("/scale-tare")
+def manual_scale_tare(req: ScaleTareReq):
+    if hasattr(scale, "manual_tare"):
+        return scale.manual_tare(force=bool(req.force))
+    return {
+        "status": "error",
+        "message": "当前电子秤驱动不支持手动清零",
+    }
+
+
 def _install_scale_get_features_if_missing() -> None:
     """
     兼容当前 RealTimeScale 实现。
@@ -189,11 +231,112 @@ def _has_weighted_item(raw_weight: float) -> bool:
     return max(0.0, float(raw_weight)) >= MIN_OBJECT_WEIGHT_GRAMS
 
 
-def _should_suppress_empty_scale_prediction(prediction: str, raw_weight: float) -> bool:
+def _should_suppress_empty_scale_prediction(
+    prediction: str,
+    raw_weight: float,
+    detection_source: str = "",
+) -> bool:
+    """
+    空秤保护只压制 LSTM 这类不稳定来源的 swap/lift。
+
+    weight_guard 是基于真实重量轨迹生成的强信号。托底场景本来就可能把
+    90g 左右的小商品压到 20g 甚至更低，因此不能再因为当前重量低于
+    MIN_OBJECT_WEIGHT_GRAMS 而把 weight_guard 的 lift/swap 清回 normal。
+    """
+    if detection_source == "weight_guard" and prediction in WEIGHT_REQUIRED_LSTM_PREDICTIONS:
+        return False
+
     return (
         prediction in WEIGHT_REQUIRED_LSTM_PREDICTIONS
         and not _has_weighted_item(raw_weight)
     )
+
+
+def _normal_jitter_limit(reference_weight: float) -> float:
+    return max(NORMAL_WEIGHT_JITTER_GRAMS, max(0.0, float(reference_weight)) * NORMAL_WEIGHT_JITTER_RATIO)
+
+
+def _significant_weight_limit(reference_weight: float) -> float:
+    return max(
+        ANTI_CHEAT_SIGNIFICANT_WEIGHT_GRAMS,
+        max(0.0, float(reference_weight)) * ANTI_CHEAT_SIGNIFICANT_WEIGHT_RATIO,
+    )
+
+
+def _classify_weight_pattern(raw_weight: float, weight_diff: float, vision_features) -> str:
+    weight = max(0.0, float(raw_weight))
+    diff = float(weight_diff)
+    previous_weight = max(0.0, weight - diff)
+    reference_weight = max(weight, previous_weight)
+    abs_diff = abs(diff)
+    hand_dist = float(vision_features[2])
+    occlusion_ratio = float(vision_features[3])
+    hand_near = hand_dist >= 0.18 or occlusion_ratio >= 0.10
+
+    if abs_diff <= _normal_jitter_limit(reference_weight):
+        return "stable_or_jitter"
+    if diff <= -_significant_weight_limit(reference_weight):
+        return "significant_drop_with_hand" if hand_near else "significant_drop"
+    if diff >= _significant_weight_limit(reference_weight):
+        return "significant_rise_with_hand" if hand_near else "significant_rise"
+    if hand_near:
+        return "moderate_change_with_hand"
+    return "moderate_change"
+
+
+def _gate_lstm_prediction(
+    *,
+    prediction: str,
+    score: float,
+    threshold: float,
+    raw_weight: float,
+    weight_pattern: str,
+    occlusion_guard: RealtimeOcclusionGuard,
+    occlusion_hold_seconds: float,
+    occlusion_alert_seconds: float,
+    consecutive_count: int,
+) -> tuple[bool, str]:
+    if prediction in {"normal", "unknown", "api_offline", "worker_error"}:
+        return False, "lstm normal or unavailable"
+    if score < threshold:
+        return False, f"lstm score {score:.3f} below threshold {threshold:.3f}"
+    if consecutive_count < LSTM_CONFIRM_WINDOWS:
+        return False, f"waiting for consecutive {prediction} confirmation"
+    if _should_suppress_empty_scale_prediction(prediction, raw_weight):
+        return False, f"scale weight {raw_weight:.1f}g below object threshold"
+
+    if prediction == "occlusion":
+        if not occlusion_guard.is_alert_ready(occlusion_alert_seconds):
+            return False, (
+                f"occlusion hold {occlusion_hold_seconds:.2f}s below "
+                f"{occlusion_alert_seconds:.2f}s"
+            )
+        if weight_pattern not in {"stable_or_jitter", "moderate_change_with_hand", "moderate_change"}:
+            return False, f"occlusion requires stable weight, got {weight_pattern}"
+        return True, "lstm occlusion confirmed by sustained ROI occlusion and stable weight"
+
+    if prediction == "lift":
+        if weight_pattern not in {
+            "significant_drop",
+            "significant_drop_with_hand",
+            "moderate_change_with_hand",
+        }:
+            return False, f"lift requires sustained low/drop weight, got {weight_pattern}"
+        if occlusion_hold_seconds < 0.5:
+            return False, f"lift requires hand/occlusion context, hold={occlusion_hold_seconds:.2f}s"
+        return True, "lstm lift confirmed by weight drop and hand/occlusion context"
+
+    if prediction == "swap":
+        if weight_pattern not in {
+            "significant_drop",
+            "significant_drop_with_hand",
+            "significant_rise",
+            "significant_rise_with_hand",
+        }:
+            return False, f"swap requires significant weight trajectory, got {weight_pattern}"
+        return True, "lstm swap confirmed by significant weight trajectory"
+
+    return False, f"unsupported lstm abnormal prediction {prediction}"
 
 
 def _post_verify_request(sequence: list[list[float]]) -> Dict[str, Any]:
@@ -266,7 +409,7 @@ def _build_alarm_transaction_id(websocket: WebSocket) -> str:
 
 
 def _save_alarm_clip_and_insert_log(
-    frames: list,
+    frames: list[OrderVideoFrame],
     violation_type: str,
     lstm_score: float,
     transaction_id: str,
@@ -288,34 +431,26 @@ def _save_alarm_clip_and_insert_log(
     save_path = os.path.join(ALARM_DIR, filename)
     shot_path = f"{ALARM_RELATIVE_DIR}/{filename}"
 
-    first_frame = frames[0]
-    height, width = first_frame.shape[:2]
+    output_frames, stats = resample_timestamped_frames(
+        frames,
+        seconds=FRAME_CACHE_SECONDS,
+        target_fps=FRAME_CACHE_TARGET_FPS,
+    )
+    write_result = write_video_file(save_path, output_frames, fps=FRAME_CACHE_TARGET_FPS)
+    if not write_result.get("ok"):
+        return {"ok": False, "error": write_result.get("error", "VideoWriter open failed")}
 
-    # 优先写 mp4；如果当前 OpenCV/系统编码器不支持 mp4v，则自动降级为 avi。
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(save_path, fourcc, FRAME_CACHE_FPS_ESTIMATE, (width, height))
-    if not writer.isOpened():
-        filename = f"{timestamp}_{safe_type}.avi"
-        save_path = os.path.join(ALARM_DIR, filename)
-        shot_path = f"{ALARM_RELATIVE_DIR}/{filename}"
-        fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        writer = cv2.VideoWriter(save_path, fourcc, FRAME_CACHE_FPS_ESTIMATE, (width, height))
-
-    if not writer.isOpened():
-        return {"ok": False, "error": "VideoWriter open failed"}
-
-    try:
-        for frame in frames:
-            if frame is None:
-                continue
-
-            # raw_img 正常是 640x640 BGR uint8；这里保留兜底逻辑，防止偶发尺寸变化。
-            if frame.shape[:2] != (height, width):
-                frame = cv2.resize(frame, (width, height))
-
-            writer.write(frame)
-    finally:
-        writer.release()
+    video_info = inspect_video_file(save_path)
+    print(
+        "Alarm video saved "
+        f"transaction_id={transaction_id} violation_type={violation_type} "
+        f"selected_count={stats['selected_frame_count']} "
+        f"first_ts={stats['first_ts']:.3f} last_ts={stats['last_ts']:.3f} "
+        f"duration={stats['duration']:.3f} real_fps={stats['real_fps']:.3f} "
+        f"write_fps={FRAME_CACHE_TARGET_FPS:.3f} path={save_path} "
+        f"saved_frame_count={video_info['frame_count']:.0f} saved_fps={video_info['fps']:.3f} "
+        f"saved_duration={video_info['duration']:.3f}"
+    )
 
     db = SessionLocal()
     try:
@@ -333,7 +468,7 @@ def _save_alarm_clip_and_insert_log(
             "ok": True,
             "log_id": alarm.log_id,
             "shot_path": shot_path,
-            "frame_count": len(frames),
+            "frame_count": int(write_result.get("frame_count", len(output_frames))),
         }
     except Exception as exc:
         db.rollback()
@@ -352,7 +487,7 @@ def _draw_detections(raw_img, detections: list[Dict[str, Any]]):
 
     for item in detections:
         x1, y1, x2, y2 = item["bbox"]
-        label_to_draw = item["label"]
+        label_to_draw = item.get("draw_label") or item.get("label") or item.get("display_name") or "item"
         conf = item["conf"]
 
         cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -422,6 +557,63 @@ def _filter_roi_detections(
         for detection in detections
         if _detection_center_in_roi(detection, roi, image_shape)
     ]
+
+
+def _get_detection_median_depth_mm(
+    detection: Dict[str, Any],
+    depth,
+    rgb_shape: tuple[int, int],
+    *,
+    min_valid_mm: float = 300.0,
+    max_valid_mm: float = 2500.0,
+    min_valid_ratio: float = 0.01,
+) -> Dict[str, Any]:
+    """计算检测框内有效深度中位数，返回统一的过滤诊断信息。"""
+    if depth is None:
+        return {"valid": False, "median_depth_mm": None, "valid_ratio": 0.0, "reason": "invalid_depth"}
+
+    box = detection.get("bbox") or detection.get("box")
+    if not box or len(box) != 4:
+        return {"valid": False, "median_depth_mm": None, "valid_ratio": 0.0, "reason": "invalid_bbox"}
+
+    height, width = rgb_shape[:2]
+    depth_img = depth
+    if getattr(depth_img, "ndim", 0) == 3:
+        depth_img = depth_img[:, :, 0]
+    if depth_img.shape[:2] != (height, width):
+        depth_img = cv2.resize(depth_img, (width, height), interpolation=cv2.INTER_NEAREST)
+
+    x1, y1, x2, y2 = [int(round(float(value))) for value in box]
+    x1 = max(0, min(width - 1, x1))
+    y1 = max(0, min(height - 1, y1))
+    x2 = max(x1 + 1, min(width, x2))
+    y2 = max(y1 + 1, min(height, y2))
+
+    roi_depth = depth_img[y1:y2, x1:x2].astype(np.float32, copy=False)
+    if roi_depth.size == 0:
+        return {"valid": False, "median_depth_mm": None, "valid_ratio": 0.0, "reason": "invalid_depth"}
+
+    valid_mask = (
+        np.isfinite(roi_depth)
+        & (roi_depth > 0)
+        & (roi_depth >= float(min_valid_mm))
+        & (roi_depth <= float(max_valid_mm))
+    )
+    valid_ratio = float(np.count_nonzero(valid_mask) / max(1, roi_depth.size))
+    if valid_ratio < float(min_valid_ratio):
+        return {
+            "valid": False,
+            "median_depth_mm": None,
+            "valid_ratio": valid_ratio,
+            "reason": "invalid_depth",
+        }
+
+    return {
+        "valid": True,
+        "median_depth_mm": float(np.median(roi_depth[valid_mask])),
+        "valid_ratio": valid_ratio,
+        "reason": "ok",
+    }
 
 
 def _build_recognition_result(
@@ -496,15 +688,15 @@ TERMINAL_PRICE_FALLBACK = {
 }
 
 
-def _resolve_unit_price(display_name: str, freshness: str) -> float:
+def _resolve_unit_price(pricing_name: str, freshness: str) -> float:
     db = SessionLocal()
     try:
         unit_price = db.execute(
             text("SELECT price FROM fruit_inventory WHERE item_name = :item_name LIMIT 1"),
-            {"item_name": display_name},
+            {"item_name": pricing_name},
         ).scalar()
         if unit_price is None:
-            unit_price = TERMINAL_PRICE_FALLBACK.get(display_name)
+            unit_price = TERMINAL_PRICE_FALLBACK.get(pricing_name)
         if unit_price is None:
             return 0.0
 
@@ -515,18 +707,26 @@ def _resolve_unit_price(display_name: str, freshness: str) -> float:
             return round(unit_price * 0.5, 2)
         return round(unit_price, 2)
     except Exception:
-        return round(float(TERMINAL_PRICE_FALLBACK.get(display_name, 0.0)), 2)
+        return round(float(TERMINAL_PRICE_FALLBACK.get(pricing_name, 0.0)), 2)
     finally:
         db.close()
 
 
 def _attach_pricing(stable_result: Dict[str, Any], weight_kg: float) -> Dict[str, Any]:
     display_name = str(stable_result.get("display_name") or stable_result.get("label") or "未识别商品")
+    pricing_name = str(
+        stable_result.get("pricing_name")
+        or stable_result.get("name_zh")
+        or stable_result.get("display_name")
+        or stable_result.get("label")
+        or "未识别商品"
+    )
     freshness = str(stable_result.get("freshness") or "普通")
-    unit_price = _resolve_unit_price(display_name, freshness)
+    unit_price = _resolve_unit_price(pricing_name, freshness)
     return {
         **stable_result,
         "display_name": display_name,
+        "pricing_name": pricing_name,
         "freshness": freshness,
         "unit_price": unit_price,
         "total_price": round(unit_price * max(0.0, float(weight_kg)), 2),
@@ -542,7 +742,7 @@ async def video_feed(websocket: WebSocket):
     1. 采集 RGB/Depth 帧；
     2. 非阻塞提取手部视觉特征和电子秤重量特征；
     3. 将 4 维视觉特征 + 2 维重量特征写入 DataAligner；
-    4. 使用 RGB YOLO 识别果蔬，并用 Depth 做辅助校验；
+    4. 使用颜色模板识别果蔬，并按会话开关决定是否用 Depth 做辅助过滤；
     5. 满 60 帧后，每 10 帧异步请求一次 /api/transaction/verify；
     6. 将视频、检测结果、重量和防作弊状态一起推送给前端。
     """
@@ -561,23 +761,38 @@ async def video_feed(websocket: WebSocket):
     alarm_future: Optional[asyncio.Future] = None
 
     # 持续缓存最近 6 秒 raw_img 原始帧，供作弊瞬间生成证据视频。
-    frame_buffer: Deque = deque(maxlen=FRAME_BUFFER_MAXLEN)
+    frame_buffer: Deque[OrderVideoFrame] = deque(maxlen=FRAME_BUFFER_MAXLEN)
 
     # 默认状态为正常。只有后台校验接口明确返回 is_secure=False 时才报警。
     current_prediction = "normal"
     current_is_secure = True
     current_lstm_score = 0.0
+    lstm_raw_prediction = "normal"
+    lstm_raw_score = 0.0
+    lstm_confirm_prediction = None
+    lstm_confirm_count = 0
+    weight_pattern = "stable_or_jitter"
     current_detection_source = "normal"
     current_detection_reason = ""
     active_weight_violation = None
     weight_guard_alert_until = 0.0
     last_alarm_at = 0.0
     occlusion_hold_seconds = 0.0
+    depth_assist_enabled = True
 
     try:
         loop = asyncio.get_running_loop()
 
         while True:
+            try:
+                control_message = await asyncio.wait_for(websocket.receive_json(), timeout=0.001)
+                if isinstance(control_message, dict) and control_message.get("type") == "depth_assist":
+                    depth_assist_enabled = bool(control_message.get("enabled", True))
+            except asyncio.TimeoutError:
+                pass
+            except WebSocketDisconnect:
+                raise
+
             # 配置服务优先返回内存快照，后台保存后立即更新，无需重启服务。
             runtime_config = get_runtime_config()
 
@@ -602,6 +817,7 @@ async def video_feed(websocket: WebSocket):
             # 仅当该比例持续超过阈值 5 秒，才允许 occlusion 告警通过。
             occlusion_ratio = float(vision_features[3])
             now = monotonic()
+            weight_pattern = _classify_weight_pattern(raw_weight, weight_diff, vision_features)
             occlusion_violation = occlusion_guard.update(
                 now=now,
                 occlusion_ratio=occlusion_ratio,
@@ -644,17 +860,48 @@ async def video_feed(websocket: WebSocket):
                 verify_future = None
 
                 if result.get("ok"):
-                    current_prediction = result.get("prediction", "unknown")
-                    current_is_secure = bool(result.get("is_secure", True))
-                    current_lstm_score = float(result.get("lstm_score", 0.0))
-                    current_detection_source = "lstm"
-                    current_detection_reason = ""
+                    lstm_raw_prediction = result.get("prediction", "unknown")
+                    lstm_raw_score = float(result.get("lstm_score", 0.0))
+                    if lstm_raw_prediction == lstm_confirm_prediction:
+                        lstm_confirm_count += 1
+                    else:
+                        lstm_confirm_prediction = lstm_raw_prediction
+                        lstm_confirm_count = 1
+
+                    alert_allowed, gate_reason = _gate_lstm_prediction(
+                        prediction=lstm_raw_prediction,
+                        score=lstm_raw_score,
+                        threshold=runtime_config.anti_cheat_threshold,
+                        raw_weight=raw_weight,
+                        weight_pattern=weight_pattern,
+                        occlusion_guard=occlusion_guard,
+                        occlusion_hold_seconds=occlusion_hold_seconds,
+                        occlusion_alert_seconds=runtime_config.occlusion_duration_threshold,
+                        consecutive_count=lstm_confirm_count,
+                    )
+
+                    if alert_allowed and not bool(result.get("is_secure", True)):
+                        current_prediction = lstm_raw_prediction
+                        current_is_secure = False
+                        current_lstm_score = lstm_raw_score
+                        current_detection_source = "lstm_gated"
+                        current_detection_reason = gate_reason
+                    else:
+                        current_prediction = "normal"
+                        current_is_secure = True
+                        current_lstm_score = lstm_raw_score
+                        current_detection_source = "lstm_gate"
+                        current_detection_reason = gate_reason
 
                     # 低置信度输出不拦截，阈值可由管理员后台实时微调。
                     if current_lstm_score < runtime_config.anti_cheat_threshold:
                         current_is_secure = True
 
-                    if _should_suppress_empty_scale_prediction(current_prediction, raw_weight):
+                    if _should_suppress_empty_scale_prediction(
+                        current_prediction,
+                        raw_weight,
+                        current_detection_source,
+                    ):
                         suppressed_prediction = current_prediction
                         current_prediction = "normal"
                         current_is_secure = True
@@ -694,7 +941,11 @@ async def video_feed(websocket: WebSocket):
                 current_detection_source = "weight_guard"
                 current_detection_reason = active_weight_violation.reason
 
-            if _should_suppress_empty_scale_prediction(current_prediction, raw_weight):
+            if _should_suppress_empty_scale_prediction(
+                current_prediction,
+                raw_weight,
+                current_detection_source,
+            ):
                 suppressed_prediction = current_prediction
                 current_prediction = "normal"
                 current_is_secure = True
@@ -753,8 +1004,13 @@ async def video_feed(websocket: WebSocket):
             # 5. 释放一次协程控制权，让 FastAPI/事件循环有机会处理网络发送和断开事件。
             await asyncio.sleep(0.01)
 
-            # 6. RGB YOLO 分类 + Depth 辅助校验。
-            detections, _ = detector.detect(infer_frame)
+            # 6. 颜色模板分类 + 可选 Depth 辅助过滤。
+            detections, _ = detector.detect(
+                infer_frame,
+                depth=depth,
+                depth_filter_enabled=depth_assist_enabled,
+                max_object_depth_mm=runtime_config.max_object_depth_mm,
+            )
             best_roi_detection = _best_roi_detection(
                 detections,
                 vision.roi,
@@ -765,24 +1021,72 @@ async def video_feed(websocket: WebSocket):
                 vision.roi,
                 infer_frame.shape[:2],
             )
+            min_confidence = float(runtime_config.min_confidence_threshold)
+            confidence_filtered_detections = [
+                detection
+                for detection in roi_detections
+                if float(detection.get("confidence", detection.get("conf", 0.0))) >= min_confidence
+            ]
             item_analysis = analyze_detected_items(
-                roi_detections,
-                confidence_threshold=runtime_config.min_confidence_threshold,
+                confidence_filtered_detections,
+                confidence_threshold=min_confidence,
             )
 
             validated_detections = []
             depth_checks = []
             frame_status = item_analysis["status"]
             frame_message = item_analysis["message"]
+            depth_filter_message = ""
 
             if frame_status != "multi_item_error":
                 for detection in item_analysis["effective_detections"]:
+                    if not depth_assist_enabled:
+                        depth_checks.append({"valid": True, "reason": "depth_assist_disabled"})
+                        validated_detections.append({
+                            **detection,
+                            "depth_check": {"valid": True, "reason": "depth_assist_disabled"},
+                        })
+                        continue
+
+                    distance_check = _get_detection_median_depth_mm(
+                        detection,
+                        depth,
+                        infer_frame.shape[:2],
+                    )
+                    if not distance_check.get("valid"):
+                        frame_status = "invalid_depth"
+                        frame_message = "深度数据不可用，请检查深度相机"
+                        depth_filter_message = frame_message
+                        depth_checks.append(distance_check)
+                        break
+
+                    if float(distance_check["median_depth_mm"]) > float(runtime_config.max_object_depth_mm):
+                        frame_status = "depth_too_far"
+                        frame_message = "商品距离超过有效识别范围，请靠近秤面或调整位置"
+                        depth_filter_message = "商品距离超过有效识别范围"
+                        depth_checks.append({
+                            **distance_check,
+                            "valid": False,
+                            "reason": "too_far",
+                            "max_object_depth_mm": runtime_config.max_object_depth_mm,
+                        })
+                        break
+
                     depth_check = depth_validator.validate_detection(
                         detection,
                         depth,
                         rgb_shape=infer_frame.shape[:2],
                     )
-                    enriched = {**detection, "depth_check": depth_check}
+                    depth_check = {
+                        **depth_check,
+                        "median_depth_mm": float(distance_check["median_depth_mm"]),
+                        "valid_ratio": float(distance_check["valid_ratio"]),
+                    }
+                    enriched = {
+                        **detection,
+                        "depth_mm": float(distance_check["median_depth_mm"]),
+                        "depth_check": depth_check,
+                    }
                     depth_checks.append(depth_check)
                     if depth_check.get("valid"):
                         validated_detections.append(enriched)
@@ -822,7 +1126,7 @@ async def video_feed(websocket: WebSocket):
                     frame_message = (
                         f"ROI 区域内果蔬识别置信度 "
                         f"{float(best_roi_detection.get('conf', 0.0)):.2f} "
-                        f"低于后台 YOLO 阈值 {runtime_config.min_confidence_threshold:.2f}"
+                        f"低于后台识别置信度阈值 {runtime_config.min_confidence_threshold:.2f}"
                     )
                 else:
                     frame_status = "no_object"
@@ -842,7 +1146,13 @@ async def video_feed(websocket: WebSocket):
             pricing_items = []
 
             # 7. 缓存浏览器显示用原始比例帧。必须 copy，避免后续绘制框或数组复用影响证据视频。
-            frame_buffer.append(display_frame.copy())
+            frame_buffer.append(
+                OrderVideoFrame(
+                    frame=display_frame.copy(),
+                    ts=monotonic(),
+                    wall_time=datetime.now(),
+                )
+            )
             cache_order_video_frame(display_frame)
 
             # 8. 如果 LSTM 判定当前窗口存在作弊，触发一次后台证据留存。
@@ -857,7 +1167,14 @@ async def video_feed(websocket: WebSocket):
             if can_create_alarm:
                 last_alarm_at = now
                 transaction_id = _build_alarm_transaction_id(websocket)
-                cached_frames = [frame.copy() for frame in frame_buffer]
+                cached_frames = [
+                    OrderVideoFrame(
+                        frame=sample.frame.copy(),
+                        ts=sample.ts,
+                        wall_time=sample.wall_time,
+                    )
+                    for sample in frame_buffer
+                ]
                 alarm_future = loop.run_in_executor(
                     ALARM_EXECUTOR,
                     _save_alarm_clip_and_insert_log,
@@ -867,7 +1184,12 @@ async def video_feed(websocket: WebSocket):
                     transaction_id,
                 )
 
-            annotated_img = _draw_detections(display_frame, detections)
+            visible_detections = (
+                validated_detections
+                if frame_status in {"normal", "same_category_multiple"}
+                else []
+            )
+            annotated_img = _draw_detections(display_frame, visible_detections)
             if hand_overlay_enabled:
                 annotated_img = vision.draw_debug_overlay(annotated_img)
 
@@ -894,6 +1216,15 @@ async def video_feed(websocket: WebSocket):
             # 11. 构造防作弊信令。正常时只发送 status=normal；
             # 异常时额外发送 type，例如 swap 或 occlusion。
             security_signal = _build_security_signal(current_is_secure, current_prediction)
+            scale_tare_debug = (
+                scale.get_tare_debug_state()
+                if hasattr(scale, "get_tare_debug_state")
+                else {
+                    "scale_tare_state": "unsupported",
+                    "scale_auto_tare_enabled": False,
+                    "scale_zero_protected": True,
+                }
+            )
 
             message = {
                 "image": jpg_text,
@@ -928,8 +1259,19 @@ async def video_feed(websocket: WebSocket):
                 "anti_cheat_threshold": runtime_config.anti_cheat_threshold,
                 "occlusion_duration_threshold": runtime_config.occlusion_duration_threshold,
                 "min_confidence_threshold": runtime_config.min_confidence_threshold,
+                "depth_assist_enabled": depth_assist_enabled,
+                "max_object_depth_mm": runtime_config.max_object_depth_mm,
+                "depth_filter_applied": depth_assist_enabled,
+                "depth_filter_message": depth_filter_message,
                 "detection_source": current_detection_source,
                 "detection_reason": current_detection_reason,
+                "lstm_raw_prediction": lstm_raw_prediction,
+                "lstm_raw_score": round(lstm_raw_score, 3),
+                "lstm_confirm_count": lstm_confirm_count,
+                "final_anti_cheat_prediction": current_prediction,
+                "anti_cheat_gate_reason": current_detection_reason,
+                "weight_pattern": weight_pattern,
+                **scale_tare_debug,
             }
             if security_signal["status"] == "alert":
                 message["type"] = security_signal["type"]
@@ -940,6 +1282,8 @@ async def video_feed(websocket: WebSocket):
 
             frame_count += 1
 
+    except WebSocketDisconnect:
+        pass
     except Exception as exc:
         print(f"WebSocket disconnected or stopped: {exc}")
     finally:

@@ -58,7 +58,20 @@
           >
             {{ isRecognizing ? '停止识别' : '开启识别' }}
           </button>
+          <button
+            :class="['btn', depthAssistEnabled ? 'btn-primary' : 'btn-secondary']"
+            @click="toggleDepthAssist"
+          >
+            深度辅助：{{ depthAssistEnabled ? '开启' : '关闭' }}
+          </button>
+          <button class="btn btn-secondary" @click="manualTareScale">
+            空秤清零
+          </button>
+          <span class="depth-assist-status">
+            有效距离 ≤ {{ Number(maxObjectDepthMm || 1800).toFixed(0) }}mm
+          </span>
         </div>
+        <p v-if="depthAssistNotice" class="depth-assist-notice">{{ depthAssistNotice }}</p>
       </div>
 
       <div class="cart-section">
@@ -251,6 +264,9 @@ const roiDraftStart = ref(null);
 const isDrawingRoi = ref(false);
 const videoGeometryVersion = ref(0);
 const handOverlayEnabled = ref(false);
+const depthAssistEnabled = ref(true);
+const maxObjectDepthMm = ref(1800);
+const depthAssistNotice = ref('已开启深度辅助，超过有效距离的目标不会计价');
 const showTerminalCheatAlert = ref(false);
 const terminalCheatAlert = ref({});
 const hasMultiItemError = ref(false);
@@ -302,6 +318,22 @@ const cartTotalWeight = computed(() => {
 });
 
 // === 原有：摄像头与识别逻辑 ===
+const sendDepthAssistState = () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    type: 'depth_assist',
+    enabled: depthAssistEnabled.value
+  }));
+};
+
+const toggleDepthAssist = () => {
+  depthAssistEnabled.value = !depthAssistEnabled.value;
+  depthAssistNotice.value = depthAssistEnabled.value
+    ? '已开启深度辅助，超过有效距离的目标不会计价'
+    : '已关闭深度距离过滤，仅按识别置信度判断';
+  sendDepthAssistState();
+};
+
 const toggleRecognition = async () => {
   isRecognizing.value = !isRecognizing.value;
 
@@ -310,7 +342,10 @@ const toggleRecognition = async () => {
     terminalCheatAlert.value = {};
     const socket = new WebSocket('ws://localhost:8000/video/ws');
     ws = socket;
-    socket.onopen = () => console.log('已连接到后端相机流');
+    socket.onopen = () => {
+      console.log('已连接到后端相机流');
+      sendDepthAssistState();
+    };
 
     socket.onmessage = (event) => {
       // 旧连接关闭过程中可能仍有已排队消息，只处理当前活动 WebSocket。
@@ -319,6 +354,11 @@ const toggleRecognition = async () => {
       const data = JSON.parse(event.data);
       currentImage.value = data.image;
       handOverlayEnabled.value = Boolean(data.hand_overlay_enabled);
+      depthAssistEnabled.value = Boolean(data.depth_assist_enabled ?? depthAssistEnabled.value);
+      maxObjectDepthMm.value = Number(data.max_object_depth_mm || maxObjectDepthMm.value || 1800);
+      if (data.depth_filter_message) {
+        depthAssistNotice.value = data.depth_filter_message;
+      }
 
       let realWeight = Math.max(0, data.weight || 0);
       recognitionStatus.value = data.recognition_status || 'waiting';
@@ -375,11 +415,12 @@ const toggleRecognition = async () => {
 const getRecognitionHint = (data) => {
   const status = data.recognition_status || data.status || data.item_status;
   const hints = {
-    low_confidence: '\u8bc6\u522b\u7f6e\u4fe1\u5ea6\u4f4e\u4e8e\u540e\u53f0 YOLO \u9608\u503c\uff0c\u8bf7\u91cd\u65b0\u6446\u653e\u5546\u54c1',
+    low_confidence: '识别置信度低于后台阈值，请重新摆放商品',
     multi_item_error: '\u68c0\u6d4b\u5230\u591a\u79cd\u679c\u852c\uff0c\u8bf7\u4e00\u6b21\u4ec5\u653e\u7f6e\u4e00\u79cd\u5546\u54c1\u79f0\u91cd',
     occlusion_detected: '\u68c0\u6d4b\u5230\u906e\u6321\uff0c\u8bf7\u79fb\u5f00\u624b\u90e8\u6216\u906e\u6321\u7269',
     target_not_on_scale: '\u8bf7\u5c06\u5546\u54c1\u653e\u7f6e\u5230\u79e4\u9762\u4e2d\u592e',
     invalid_depth: '\u6df1\u5ea6\u6570\u636e\u4e0d\u53ef\u7528\uff0c\u8bf7\u68c0\u67e5\u6df1\u5ea6\u76f8\u673a',
+    depth_too_far: '商品距离超过有效识别范围，请靠近秤面或调整位置',
     depth_out_of_range: '\u5546\u54c1\u8ddd\u79bb\u8d85\u51fa\u6709\u6548\u6df1\u5ea6\u8303\u56f4',
     no_object: '\u672a\u68c0\u6d4b\u5230\u5546\u54c1'
   };
@@ -391,7 +432,9 @@ const parseStableResult = (item, currentWeight) => {
     return;
   }
 
-  const displayName = item.display_name || item.name || item.label || '未识别商品';
+  const displayName = item.name_en || item.display_name || item.name || item.label || '未识别商品';
+  const nameZh = item.name_zh || item.pricing_name || item.name || displayName;
+  const pricingName = item.pricing_name || item.name_zh || nameZh;
   const freshness = item.freshness || '普通';
   const unitPrice = Number(item.unit_price ?? item.unitPrice ?? 0);
   const weight = Number(item.weight ?? item.weight_kg ?? currentWeight ?? 0);
@@ -399,6 +442,9 @@ const parseStableResult = (item, currentWeight) => {
 
   currentDetected.value = {
     name: displayName,
+    nameEn: displayName,
+    nameZh,
+    pricingName,
     freshness: freshness,
     unitPrice: unitPrice,
     weight,
@@ -416,6 +462,9 @@ const addToCart = () => {
   if (currentDetected.value) {
     cartItems.value.push({
       name: currentDetected.value.name,
+      name_en: currentDetected.value.nameEn,
+      name_zh: currentDetected.value.nameZh,
+      pricing_name: currentDetected.value.pricingName,
       freshness: currentDetected.value.freshness,
       weight: currentDetected.value.weight.toFixed(2),
       unitPrice: currentDetected.value.unitPrice.toFixed(2),
@@ -863,6 +912,10 @@ onBeforeUnmount(() => {
 .btn-success { background-color: #4CAF50; }
 .btn-danger { background-color: #f44336; }
 .btn-primary { background-color: #2196F3; }
+.btn-secondary { background-color: #6b7280; }
+.controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.depth-assist-status { color: #374151; font-weight: 700; font-size: 14px; }
+.depth-assist-notice { margin: 8px 0 0; color: #4b5563; font-size: 13px; }
 .checkout-btn { width: 100%; margin-top: 15px; font-size: 18px; padding: 15px; }
 .btn-remove { background-color: #ff5252; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; margin-left: 10px;}
 

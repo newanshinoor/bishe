@@ -171,15 +171,27 @@ class OrderCreateReq(BaseModel):
 
 TERMINAL_PRICE_MAP = {
     "苹果": 4.5,
+    "香蕉": 3.5,
+    "黄瓜": 2.8,
     "番茄": 3.2,
     "芒果": 8.5,
     "橙子": 5.0,
 }
 
 
+def _item_pricing_name(item: Dict[str, Any]) -> str:
+    """订单、库存和价格查询使用中文商品名，前端展示名可以保持英文。"""
+    return str(
+        item.get("pricing_name")
+        or item.get("name_zh")
+        or item.get("name")
+        or ""
+    ).strip()
+
+
 def _get_backend_unit_price(db: Session, item: Dict[str, Any]) -> float:
     """Resolve the server-owned unit price used during checkout."""
-    product_name = str(item.get("name", "")).strip()
+    product_name = _item_pricing_name(item)
     unit_price = TERMINAL_PRICE_MAP.get(product_name)
     if unit_price is None:
         unit_price = db.execute(
@@ -213,7 +225,7 @@ def _validate_cart_inventory_available(db: Session, items: List[Dict[str, Any]])
     """Pre-check stock before generating a payment QR code."""
     required_by_product: Dict[str, float] = {}
     for item in items:
-        product_name = str(item.get("name", "")).strip()
+        product_name = _item_pricing_name(item)
         weight = max(0.0, float(item.get("weight", 0)))
         if not product_name or weight <= 0:
             continue
@@ -310,7 +322,7 @@ async def create_transaction(
                 payment_order_id=parent_order_id,
                 payment_status="pending",
                 customer_id=customer_id,
-                product_name=item.get("name", "未知商品"),
+                product_name=_item_pricing_name(item) or item.get("name", "未知商品"),
                 total_amount=item_weight,  # 交易原始总重
                 pay_amount=item_pay_amount,  # 顾客实际支付扣款额
                 profit=item_profit,  # 本单利润

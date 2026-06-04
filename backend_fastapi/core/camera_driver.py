@@ -35,6 +35,15 @@ def _env_fourcc(name: str, default: str) -> str:
     return (value or default)[:4].ljust(4)
 
 
+def _camera_backend(name: str):
+    value = os.getenv(name, "DEFAULT").strip().upper()
+    if value == "DSHOW":
+        return cv2.CAP_DSHOW, "DSHOW"
+    if value == "MSMF":
+        return cv2.CAP_MSMF, "MSMF"
+    return None, "DEFAULT"
+
+
 class AstraCamera:
     def __init__(self):
         self.cap = None
@@ -46,6 +55,7 @@ class AstraCamera:
         self.mock_image = None
         self.init_error = None
         self.last_color_img = None
+        self._depth_align_logged = False
 
         if _env_flag("USE_MOCK_HARDWARE") or _env_flag("MOCK_CAMERA"):
             self._enable_mock("mock hardware enabled")
@@ -77,32 +87,48 @@ class AstraCamera:
 
         color_port_value = os.getenv("RGB_CAMERA_INDEX") or os.getenv("ASTRA_COLOR_PORT") or "1"
         color_port = int(color_port_value)
-        self.cap = cv2.VideoCapture(color_port)
+        backend, backend_name = _camera_backend("RGB_CAMERA_BACKEND")
+        if backend is None:
+            self.cap = cv2.VideoCapture(color_port)
+        else:
+            self.cap = cv2.VideoCapture(color_port, backend)
         if not self.cap.isOpened():
-            raise RuntimeError(f"color camera port {color_port} cannot be opened")
+            raise RuntimeError(f"color camera port {color_port} cannot be opened with backend {backend_name}")
 
-        requested_width = _env_int("RGB_FRAME_WIDTH", 640)
-        requested_height = _env_int("RGB_FRAME_HEIGHT", 480)
+        requested_width = _env_int("RGB_FRAME_WIDTH", 1280)
+        requested_height = _env_int("RGB_FRAME_HEIGHT", 960)
         requested_fps = _env_int("RGB_CAMERA_FPS", 30)
         requested_fourcc = _env_fourcc("RGB_CAMERA_FOURCC", "MJPG")
 
-        if not self._configure_rgb_capture(
-            requested_width,
-            requested_height,
-            requested_fps,
-            requested_fourcc,
+        resolution_candidates = []
+        for size in (
+            (requested_width, requested_height),
+            (1280, 960),
+            (1280, 720),
+            (960, 720),
+            (640, 480),
         ):
-            print(
-                f"RGB {requested_width}x{requested_height} open failed; "
-                "falling back to 640x480."
-            )
-            if not self._configure_rgb_capture(640, 480, requested_fps, requested_fourcc):
-                raise RuntimeError("Astra RGB camera cannot provide a readable frame")
+            if size not in resolution_candidates:
+                resolution_candidates.append(size)
+
+        selected_size = None
+        for width, height in resolution_candidates:
+            if self._configure_rgb_capture(width, height, requested_fps, requested_fourcc):
+                selected_size = (width, height)
+                break
+            print(f"RGB {width}x{height} open failed; trying fallback resolution.")
+
+        if selected_size is None:
+            raise RuntimeError("Astra RGB camera cannot provide a readable frame")
 
         actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = self.cap.get(cv2.CAP_PROP_FPS) or requested_fps
-        print(f"Astra Pro Plus camera ready. RGB={actual_width}x{actual_height}@{actual_fps:.0f}")
+        print(
+            f"Astra Pro Plus camera ready. "
+            f"RGB={actual_width}x{actual_height}@{actual_fps:.0f} "
+            f"index={color_port} backend={backend_name}"
+        )
 
     def _configure_rgb_capture(self, width: int, height: int, fps: int, fourcc: str) -> bool:
         if self.cap is None or not self.cap.isOpened():
@@ -216,6 +242,16 @@ class AstraCamera:
             depth_img = depth_data.reshape((frame.height, frame.width))
         except Exception as exc:
             raise RuntimeError(f"Astra depth frame read failed: {exc}") from exc
+
+        if _env_flag("DEPTH_ALIGN_TO_RGB", True) and depth_img.shape[:2] != color_img.shape[:2]:
+            depth_img = cv2.resize(
+                depth_img,
+                (color_img.shape[1], color_img.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            if not self._depth_align_logged:
+                print(f"Depth aligned to RGB: depth={depth_img.shape}, color={color_img.shape[:2]}")
+                self._depth_align_logged = True
 
         return color_img, depth_img
 
